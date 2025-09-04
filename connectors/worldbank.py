@@ -5,7 +5,7 @@
 # Fallback: if none, return recently *published* items (last 365 days), capped to 20, so Slack isn't empty.
 #
 # Optional env:
-#   WB_DEBUG=1  -> print diagnostics
+#   WB_DEBUG=1  -> print diagnostics in GitHub Actions logs
 
 from __future__ import annotations
 import os, hashlib
@@ -16,7 +16,7 @@ import requests
 API = "https://search.worldbank.org/api/procnotices"
 TIMEOUT = 25
 ROWS = 100          # per page
-PAGES = 10          # total ~1,000 rows to widen the window
+PAGES = 10          # widen the window (~1000 items)
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
 DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
@@ -72,9 +72,8 @@ def _sig(item: Dict[str, str]) -> str:
     base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-def _fetch_page(start: int) -> Dict[str, Any]:
-    # Broad slice; we request only the fields we care about, but we will *also*
-    # scan unknown keys for dates to be safe.
+def _fetch_page(start: int) -> Dict[str, Any] | List[Any]:
+    # Broad slice; request common fields but also be ready for extra keys.
     params = {
         "format": "json",
         "rows": ROWS,
@@ -87,22 +86,21 @@ def _fetch_page(start: int) -> Dict[str, Any]:
 
 def _detect_date_fields(obj: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
-    Some records use different field names. We try official ones first, then scan.
-    Returns dict with 'deadline' and 'published' raw strings (or None).
+    Some records use different field names. Try official ones first, then scan.
+    Returns {'deadline': <raw>, 'published': <raw>} (strings or None).
     """
-    # 1) Preferred keys
+    # Preferred keys
     deadline_raw = obj.get("deadline")
     pub_raw = (obj.get("pub_date") or obj.get("publication_date") or
                obj.get("published_on") or obj.get("posting_date") or obj.get("post_date"))
 
-    # 2) Fallback: heuristic scan over keys
+    # Heuristic scan over keys
     if not deadline_raw:
         for k, v in obj.items():
             kl = k.lower()
             if ("dead" in kl or "clos" in kl or "submit" in kl) and isinstance(v, str):
                 deadline_raw = v
                 break
-
     if not pub_raw:
         for k, v in obj.items():
             kl = k.lower()
@@ -134,9 +132,31 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
         "summary": desc[:500],
         "region": region,
         "themes": themes,
-        # Provide publication date for debugging (not used by aggregator)
-        "_pub": pub_iso
+        "_pub": pub_iso  # for debugging only
     }
+
+def _extract_rows(payload: Dict[str, Any] | List[Any]) -> List[Dict[str, Any]]:
+    """
+    The API sometimes returns:
+      - dict with 'procnotices' (dict) or 'procurements' (dict)
+      - dict with 'data' (list)
+      - or a top-level list
+    Normalize all cases into a list of dicts.
+    """
+    if isinstance(payload, list):
+        # top-level list
+        return [r for r in payload if isinstance(r, dict)]
+
+    # dict payload:
+    for key in ("procnotices", "procurements", "data", "rows"):
+        block = payload.get(key)
+        if isinstance(block, dict):
+            return list(block.values())
+        if isinstance(block, list):
+            return [r for r in block if isinstance(r, dict)]
+
+    # last resort: if payload itself looks like a single record
+    return [payload] if isinstance(payload, dict) else []
 
 def fetch() -> List[Dict[str, str]]:
     today = datetime.utcnow().date()
@@ -156,19 +176,16 @@ def fetch() -> List[Dict[str, str]]:
                 print(f"[worldbank] fetch page start={start} error: {e}")
             break
 
-        block = payload.get("procnotices") or payload.get("procurements") or {}
-        rows = list(block.values())
+        rows = _extract_rows(payload)
         total_rows += len(rows)
         if DEBUG:
-            print(f"[worldbank] page {i+1}: {len(rows)} rows")
+            typ = type(payload).__name__
+            print(f"[worldbank] page {i+1}: payload type={typ}, rows={len(rows)}")
+            if rows:
+                print(f"[worldbank] sample keys: {sorted(list(rows[0].keys()))[:12]}")
 
         if not rows:
             break
-
-        # On first page, show a sample of keys for diagnostics:
-        if DEBUG and i == 0 and rows:
-            sample_keys = sorted(rows[0].keys())
-            print("[worldbank] sample keys:", sample_keys)
 
         for raw in rows:
             item = _normalize(raw)
@@ -183,13 +200,13 @@ def fetch() -> List[Dict[str, str]]:
                 future_items.append(item)
                 continue
 
-            # Build fallback bucket: recently *published*
+            # Fallback bucket: recently *published*
             pub_dt = _parse_date(item.get("_pub"))
             if pub_dt and pub_dt >= recent_cutoff:
                 recent_pub_items.append(item)
 
     if DEBUG:
-        print(f"[worldbank] scanned ~{total_rows} rows, future_deadlines={len(future_items)}, fallback_recent={len(recent_pub_items)}")
+        print(f"[worldbank] scanned ~{total_rows} rows, future_deadlines={len(future_items)}, recent_pub={len(recent_pub_items)}")
 
     # Primary requirement
     if future_items:
@@ -199,15 +216,12 @@ def fetch() -> List[Dict[str, str]]:
     if recent_pub_items:
         return recent_pub_items[:20]
 
-    # Last-resort fallback: if absolutely nothing matched, return the first 10 normalized items
-    # from the last page processed (so Slack isn't empty). This should be rare.
+    # Last-resort fallback (very rare)
     if DEBUG:
-        print("[worldbank] no future or recent-published items found; returning last-resort fallback.")
-    # Re-run a minimal fetch of the first page and return 10 normalized items:
+        print("[worldbank] no future or recent-published items found; returning first page raw-normalized.")
     try:
         payload = _fetch_page(0)
-        block = payload.get("procnotices") or payload.get("procurements") or {}
-        rows = list(block.values())[:10]
+        rows = _extract_rows(payload)[:10]
         return [_normalize(r) for r in rows]
     except Exception:
         return []
