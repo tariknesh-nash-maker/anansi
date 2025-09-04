@@ -1,0 +1,14 @@
+# copy to settings.toml
+regions = ["africa", "mena"]         # used to filter text
+themes  = ["ai_digital","budget","anti_corruption","climate","open_parliament","cso_support"]
+
+[slack]
+webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+
+[email]  # optional
+smtp_host = "smtp.example.com"
+smtp_port = 587
+username  = "you@example.com"
+password  = "APP_PASSWORD"
+to        = ["you@example.com"]
+from_addr = "funding-watcher@example.com"
