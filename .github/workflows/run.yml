@@ -15,11 +15,12 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WB_DEBUG: "1"
-          WB_ROWS: "100"
-          WB_PAGES: "15"              # scan up to ~1500 newest rows
-          WB_PUB_WINDOW_DAYS: "90"    # your rule
-          # Optional: bias to solicitations
-          # WB_QTERM: '("request for bids" OR "request for expressions of interest" OR eoi OR rfp)'
+          WB_ROWS: "200"               # can go up to 1000
+          WB_PAGES: "10"               # scan up to 2000 items
+          WB_PUB_WINDOW_DAYS: "90"     # your rule; try 180 while validating
+          WB_MAX_RESULTS: "40"
+          # Optional client-side filter. Start empty while validating:
+          # WB_QTERM: 'request for bids|request for expressions of interest|eoi|rfp'
       - name: Persist state
         run: |
           git config user.email "bot@users.noreply.github.com"
