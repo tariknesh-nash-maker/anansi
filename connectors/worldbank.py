@@ -10,10 +10,10 @@ import requests
 API = "https://search.worldbank.org/api/procnotices"
 TIMEOUT = 25
 ROWS = int(os.getenv("WB_ROWS", "100"))     # per page
-PAGES = int(os.getenv("WB_PAGES", "10"))    # widen window quickly via env if needed
+PAGES = int(os.getenv("WB_PAGES", "10"))    # widen via env if needed
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
-# date formats incl. ISO-8601 (with/without milliseconds)
+# date formats incl. ISO-8601 + common timestamp strings seen in WB data
 DATE_FMTS = (
     "%Y-%m-%d",
     "%d-%b-%Y", "%d %b %Y",
@@ -21,15 +21,16 @@ DATE_FMTS = (
     "%Y.%m.%d",
     "%Y-%m-%dT%H:%M:%SZ",
     "%Y-%m-%dT%H:%M:%S.%fZ",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S.%f",
 )
 
 # filtering
-DENY_TYPES = {"contract award", "award"}  # always skip awards
-# status filtering relaxed: keep most statuses, only skip obvious drafts
-DENY_STATUS = {"draft"}
+DENY_TYPES = {"contract award", "award"}  # always skip awards in Pass A/B
+DENY_STATUS = {"draft"}                   # only skip obvious drafts; keep others
 
-# fallback windows
-RECENT_PUB_DAYS = int(os.getenv("WB_RECENT_PUB_DAYS", "730"))  # 2 years
+# fallback windows (tunable via env)
+RECENT_PUB_DAYS_PASSB = int(os.getenv("WB_RECENT_PUB_DAYS", "1825"))  # 5 years
 FINAL_MAX = 20  # cap fallback list sizes
 
 def _parse_date(val: Optional[str]) -> Optional[datetime]:
@@ -104,8 +105,8 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     )
     deadline_iso = _to_iso(deadline_raw)
 
-    # publication date (noticedate observed)
-    pub_iso = _to_iso(n.get("noticedate") or n.get("pub_date") or n.get("publication_date"))
+    # publication date
+    pub_iso = _to_iso(n.get("noticedate") or n.get("pub_date") or n.get("publication_date") or n.get("posting_date"))
 
     # human-readable detail page (preferred), then API-provided URL, then JSON detail
     nid = str(n.get("id") or "").strip()
@@ -132,12 +133,15 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
 
 def fetch() -> List[Dict[str, str]]:
     today = datetime.utcnow().date()
-    pub_cutoff = datetime.utcnow() - timedelta(days=RECENT_PUB_DAYS)
+    pub_cutoff_passb = datetime.utcnow() - timedelta(days=RECENT_PUB_DAYS_PASSB)
 
     seen = set()
+    # Pass A (strict)
     future_items: List[Dict[str, str]] = []
+    # Pass B (relaxed, but no awards)
     recent_pub_items: List[Dict[str, str]] = []
-    unknown_deadline_items: List[Dict[str, str]] = []
+    # Data for last-resort
+    first_page_raw: List[Dict[str, Any]] = []
 
     for i in range(PAGES):
         start = i * ROWS
@@ -150,13 +154,18 @@ def fetch() -> List[Dict[str, str]]:
         rows = _extract_rows(payload)
         if DEBUG: print(f"[worldbank] page {i+1}: rows={len(rows)}")
         if not rows: break
+        if i == 0:
+            first_page_raw = rows[:]
 
         for raw in rows:
             nt = (str(raw.get("notice_type") or "")).lower()
             ns = (str(raw.get("notice_status") or "")).lower()
-            if any(x in nt for x in DENY_TYPES):  # skip awards
+
+            # Always skip awards for A/B passes
+            if any(x in nt for x in DENY_TYPES):
                 continue
-            if ns in DENY_STATUS:                 # skip obvious drafts only
+            # Only skip obvious drafts
+            if ns in DENY_STATUS:
                 continue
 
             item = _normalize(raw)
@@ -165,36 +174,48 @@ def fetch() -> List[Dict[str, str]]:
                 continue
             seen.add(s)
 
-            # deadline logic
+            # PASS A: future deadline only
             dl = _parse_date(item.get("deadline"))
-            if dl:
-                if dl.date() >= today:
-                    future_items.append(item)     # ✅ accept only future
-                # else past: ignore
-            else:
-                # no deadline; keep for possible fallback tiers
-                pub_dt = _parse_date(item.get("_pub"))
-                if pub_dt and pub_dt >= pub_cutoff:
-                    recent_pub_items.append(item)
-                else:
-                    unknown_deadline_items.append(item)
+            if dl and dl.date() >= today:
+                future_items.append(item)
+                continue
+
+            # PASS B pool: recently published (even if no deadline / past)
+            pub_dt = _parse_date(item.get("_pub"))
+            if pub_dt and pub_dt >= pub_cutoff_passb:
+                recent_pub_items.append(item)
 
     if DEBUG:
-        print(f"[worldbank] future={len(future_items)} recent_pub={len(recent_pub_items)} unknown_deadline={len(unknown_deadline_items)}")
+        print(f"[worldbank] future(A)={len(future_items)} recent_pub(B)={len(recent_pub_items)}")
 
-    # Tier 1 — strict: future deadlines only
+    # Pass A result
     if future_items:
         return future_items
 
-    # Tier 2 — recent publications (noticedate in last N days)
+    # Pass B result (no awards, recent publications up to 5y)
     if recent_pub_items:
         return recent_pub_items[:FINAL_MAX]
 
-    # Tier 3 — still empty: return some non-award items with unknown deadlines
-    if unknown_deadline_items:
-        return unknown_deadline_items[:FINAL_MAX]
+    # Last-resort: return first 12 items from page 1 with *all* filters off (so Slack isn't empty)
+    # NOTE: These might include awards; this tier is only used when A & B found nothing.
+    if first_page_raw:
+        out: List[Dict[str, str]] = []
+        seen2 = set()
+        for raw in first_page_raw[:50]:  # sample a bit more to avoid all-award edge cases
+            item = _normalize(raw)
+            s = _sig(item)
+            if s in seen2:
+                continue
+            # Explicitly *do not* enforce deadline/type/status here
+            out.append(item)
+            seen2.add(s)
+            if len(out) >= 12:
+                break
+        if out:
+            if DEBUG: print("[worldbank] returning last-resort fallback (unfiltered) items:", len(out))
+            return out
 
-    # Last resort: nothing found
+    # Truly nothing
     return []
 
 if __name__ == "__main__":
