@@ -15,12 +15,15 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WB_DEBUG: "1"
-          WB_ROWS: "200"               # can go up to 1000
-          WB_PAGES: "10"               # scan up to 2000 items
-          WB_PUB_WINDOW_DAYS: "90"     # your rule; try 180 while validating
-          WB_MAX_RESULTS: "40"
-          # Optional client-side filter. Start empty while validating:
-          # WB_QTERM: 'request for bids|request for expressions of interest|eoi|rfp'
+          WB_ROWS: "800"              # scan 800 per page
+          WB_PAGES: "10"              # scan 8,000 newest rows
+          WB_PUB_WINDOW_DAYS: "180"   # 6 months; drop back to 90 later
+          WB_MAX_RESULTS: "60"        # or 100 if you want a bigger list
+          # Keep / adjust topic filtering:
+          WB_REQUIRE_TOPIC_MATCH: "1" # only OGP-relevant
+          WB_TOPIC_LIST: "Access to Information|Anti-Corruption|Civic Space|Climate and Environment|Digital Governance|Fiscal Openness|Gender and Inclusion|Justice|Media Freedom|Public Participation"
+          # Optional: additional keyword filter (pipe-separated). Start empty; add later if needed:
+          WB_QTERM: ""
       - name: Persist state
         run: |
           git config user.email "bot@users.noreply.github.com"
