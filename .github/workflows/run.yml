@@ -1,29 +1,47 @@
 name: funding-watcher
+
 on:
   schedule:
     - cron: "0 */6 * * *"   # every 6 hours
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: pip install -r requirements.txt
-      - run: python aggregator.py
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run aggregator (WB + UNDP)
+        run: python aggregator.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+          # ---------- World Bank (Finances One connector) ----------
           WB_DEBUG: "1"
-          WB_ROWS: "800"              # scan 800 per page
-          WB_PAGES: "10"              # scan 8,000 newest rows
-          WB_PUB_WINDOW_DAYS: "180"   # 6 months; drop back to 90 later
-          WB_MAX_RESULTS: "60"        # or 100 if you want a bigger list
-          # Keep / adjust topic filtering:
-          WB_REQUIRE_TOPIC_MATCH: "1" # only OGP-relevant
+          WB_ROWS: "800"               # scan 800 rows per page
+          WB_PAGES: "10"               # scan 8,000 newest rows
+          WB_PUB_WINDOW_DAYS: "180"    # widen while validating; reduce to 90 later
+          WB_MAX_RESULTS: "60"
+          WB_REQUIRE_TOPIC_MATCH: "1"  # only OGP-relevant
           WB_TOPIC_LIST: "Access to Information|Anti-Corruption|Civic Space|Climate and Environment|Digital Governance|Fiscal Openness|Gender and Inclusion|Justice|Media Freedom|Public Participation"
-          # Optional: additional keyword filter (pipe-separated). Start empty; add later if needed:
-          WB_QTERM: ""
+          WB_QTERM: ""                 # optional extra filter (pipe-separated). Keep empty for volume
+
+          # ---------- UNDP connector ----------
+          UNDP_DEBUG: "1"
+          UNDP_PAGES: "10"             # how many newest listing pages to scan
+          UNDP_PUB_WINDOW_DAYS: "90"   # use 180–365 for more volume if needed
+          UNDP_MAX_RESULTS: "60"
+          UNDP_REQUIRE_TOPIC_MATCH: "1"
+          UNDP_TOPIC_LIST: "Access to Information|Anti-Corruption|Civic Space|Climate and Environment|Digital Governance|Fiscal Openness|Gender and Inclusion|Justice|Media Freedom|Public Participation"
+          UNDP_QTERM: ""               # optional extra filter (pipe-separated): e.g., "rfp|eoi|open data|beneficial ownership"
+
       - name: Persist state
         run: |
           git config user.email "bot@users.noreply.github.com"
