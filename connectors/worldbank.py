@@ -1,42 +1,58 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notice" connector via Finances One API (Dataset DS00979 / Resource RS00909)
-# Fast version with client-side recency filter.
+# Robust World Bank connector with fallback.
+# 1) Tries FinancesOne DS00979/RS00909 (fast slice)
+# 2) Falls back to Search API v2 (/api/v2/procurements) if no rows
+#
+# Output: list[{title, url, deadline, summary, region, themes}]
 
 from __future__ import annotations
-import hashlib
+import os, hashlib, time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import requests
 
-API_BASE = "https://datacatalogapi.worldbank.org/dexapps/fone/api/apiservice"
+DEBUG = os.getenv("WB_DEBUG", "0") == "1"
+
+# ---- FinancesOne settings ----
+FONE_API = "https://datacatalogapi.worldbank.org/dexapps/fone/api/apiservice"
 DATASET_ID = "DS00979"
 RESOURCE_ID = "RS00909"
+FONE_TOP = 300
 TIMEOUT = 25
-TOP = 500                 # fetch a bigger slice, then filter client-side
-RECENCY_DAYS = 540        # keep only items within last ~18 months
+
+# ---- Search API fallback ----
+SEARCH_API = "https://search.worldbank.org/api/v2/procurements"
+QTERMS = [
+    "transparency OR anti-corruption OR beneficial ownership",
+    "budget OR public finance OR fiscal transparency",
+    "digital governance OR data protection OR cybersecurity OR AI",
+    "open parliament OR legislative transparency",
+    "climate finance OR MRV OR adaptation OR resilience",
+]
+
+# Keep anything recent; if no dates, we still keep (MVP)
+RECENCY_DAYS = 720
+DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
 
 # ---------- helpers ----------
-
 def _themes_from_text(text: str) -> List[str]:
     t = text.lower()
-    themes: List[str] = []
+    tags: List[str] = []
     if any(k in t for k in ["ai", "algorithmic", "cybersecurity", "digital", "data protection"]):
-        themes.append("ai_digital")
+        tags.append("ai_digital")
     if any(k in t for k in ["budget", "public finance", "fiscal", "open budget"]):
-        themes.append("budget")
+        tags.append("budget")
     if any(k in t for k in ["beneficial ownership", "procurement", "anti-corruption", "integrity", "aml", "cft"]):
-        themes.append("anti_corruption")
+        tags.append("anti_corruption")
     if any(k in t for k in ["parliament", "legislative", "assembly", "mp disclosure"]):
-        themes.append("open_parliament")
+        tags.append("open_parliament")
     if any(k in t for k in ["climate", "adaptation", "resilience", "mrv", "just transition"]):
-        themes.append("climate")
+        tags.append("climate")
     out = []
-    for th in themes:
+    for th in tags:
         if th not in out:
             out.append(th)
     return out[:3]
-
-DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
 
 def _parse_date(val: Optional[str]) -> Optional[datetime]:
     if not val:
@@ -49,28 +65,11 @@ def _parse_date(val: Optional[str]) -> Optional[datetime]:
             continue
     return None
 
-def _to_iso_date(val: Optional[str]) -> str:
+def _to_iso(val: Optional[str]) -> str:
     dt = _parse_date(val)
     return dt.date().isoformat() if dt else (val.strip() if val else "")
 
-def _pick(row: Dict[str, Any], keys: List[str]) -> str:
-    for k in keys:
-        if k in row and row[k]:
-            return str(row[k]).strip()
-    return ""
-
-def _pick_pub_date(row: Dict[str, Any]) -> Optional[datetime]:
-    # Try common publication/update date field names
-    for key in [
-        "pub_date", "publication_date", "published_on", "publish_date",
-        "posting_date", "post_date", "date_published", "last_update", "updated_at"
-    ]:
-        dt = _parse_date(row.get(key))
-        if dt:
-            return dt
-    return None
-
-def _infer_region(text: str, region0: str) -> str:
+def _infer_region(text: str, region0: str = "") -> str:
     tl = text.lower()
     if any(k in tl for k in ["mena", "middle east", "north africa", "maghreb", "arab"]):
         return "MENA"
@@ -83,19 +82,40 @@ def _infer_region(text: str, region0: str) -> str:
         return "Africa"
     return region0 or ""
 
-def _normalize_row(row: Dict[str, Any]) -> Dict[str, str]:
+def _sig(item: Dict[str, str]) -> str:
+    base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+# ---------- FinancesOne path ----------
+def _fone_get(limit: int = FONE_TOP) -> Dict[str, Any]:
+    params = {
+        "datasetId": DATASET_ID,
+        "resourceId": RESOURCE_ID,
+        "type": "json",
+        "top": str(limit),
+        "skip": "0",
+        # "orderby": "pub_date desc"  # harmless if ignored
+    }
+    r = requests.get(FONE_API, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def _pick(row: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        if k in row and row[k]:
+            return str(row[k]).strip()
+    return ""
+
+def _fone_normalize(row: Dict[str, Any]) -> Dict[str, str]:
     title    = _pick(row, ["title", "notice_title", "subject", "project_name", "tender_title"])
     desc     = _pick(row, ["description", "summary", "notice_description", "tender_description"])
     url      = _pick(row, ["url", "link", "source_url", "notice_url"])
-    deadline_raw = _pick(row, ["deadline", "closing_date", "submission_deadline", "bid_deadline"])
-    deadline = _to_iso_date(deadline_raw)
+    deadline = _to_iso(_pick(row, ["deadline", "closing_date", "submission_deadline", "bid_deadline"]))
     country  = _pick(row, ["country", "country_name"])
     region0  = _pick(row, ["region", "region_name"])
-
     text = " ".join([title, desc, country, region0])
-    themes = ",".join(_themes_from_text(text))
     region = _infer_region(text, region0)
-
+    themes = ",".join(_themes_from_text(text))
     return {
         "title": title or "World Bank opportunity",
         "url": url,
@@ -105,66 +125,110 @@ def _normalize_row(row: Dict[str, Any]) -> Dict[str, str]:
         "themes": themes
     }
 
-def _get_latest(limit: int = TOP) -> Dict[str, Any]:
-    # Some params like ordering may be ignored; harmless if so.
+def _try_fone() -> List[Dict[str, str]]:
+    try:
+        payload = _fone_get(FONE_TOP)
+        rows = payload.get("data") or []
+        if DEBUG:
+            print(f"[worldbank] FONE rows: {len(rows)} keys: {list(payload.keys())[:5]}")
+        out, seen = [], set()
+        cutoff = datetime.utcnow() - timedelta(days=RECENCY_DAYS)
+        dropped = 0
+        for row in rows:
+            item = _fone_normalize(row)
+            # recency using deadline if any
+            d = _parse_date(item.get("deadline"))
+            if d and d < cutoff:
+                dropped += 1
+                continue
+            s = _sig(item)
+            if s not in seen:
+                out.append(item); seen.add(s)
+        if DEBUG:
+            print(f"[worldbank] FONE kept {len(out)} (dropped old: {dropped})")
+        return out
+    except Exception as e:
+        if DEBUG:
+            print(f"[worldbank] FONE error: {e}")
+        return []
+
+# ---------- Search API fallback ----------
+def _search_page(q: str, rows: int = 60, start: int = 0) -> Dict[str, Any]:
     params = {
-        "datasetId": DATASET_ID,
-        "resourceId": RESOURCE_ID,
-        "type": "json",
-        "top": str(limit),
-        "skip": "0",
-        "orderby": "pub_date desc"
+        "format": "json",
+        "qterm": q,
+        "rows": rows,
+        "fl": "title,url,deadline,description,countryname,regionname,pub_date"
     }
-    r = requests.get(API_BASE, params=params, timeout=TIMEOUT)
+    if start:
+        params["start"] = start
+    r = requests.get(SEARCH_API, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-# ---------- main fetch ----------
+def _search_normalize(n: Dict[str, Any]) -> Dict[str, str]:
+    title = (n.get("title") or "").strip()
+    url = (n.get("url") or "").strip()
+    desc = (n.get("description") or "").strip()
+    country = (n.get("countryname") or "").strip()
+    region0 = (n.get("regionname") or "").strip()
+    deadline = _to_iso(n.get("deadline") or "")
+    text = " ".join([title, desc, country, region0])
+    region = _infer_region(text, region0)
+    themes = ",".join(_themes_from_text(text))
+    return {
+        "title": title or "World Bank procurement notice",
+        "url": url,
+        "deadline": deadline,
+        "summary": desc[:500],
+        "region": region,
+        "themes": themes
+    }
 
-def fetch() -> List[Dict[str, str]]:
-    """
-    Single-call fetch, then client-side filter:
-      - keep only items with pub_date (or deadline) within RECENCY_DAYS
-    """
-    try:
-        payload = _get_latest(TOP)
-    except Exception as e:
-        print(f"[worldbank] fetch error: {e}")
-        return []
-
-    rows = payload.get("data") or []
-    out: List[Dict[str, str]] = []
-    seen = set()
-
-    now = datetime.utcnow()
-    cutoff = now - timedelta(days=RECENCY_DAYS)
-
-    dropped_old = 0
-    for row in rows:
-        pub_dt = _pick_pub_date(row)
-        # Fallback to deadline if publication date missing
-        if not pub_dt:
-            dl_dt = _parse_date(_pick(row, ["deadline", "closing_date", "submission_deadline", "bid_deadline"]))
-            pub_dt = dl_dt
-
-        # If we still don't have a date, keep it (to be safe), else filter by recency
-        if pub_dt and pub_dt < cutoff:
-            dropped_old += 1
+def _try_search(max_items: int = 200) -> List[Dict[str, str]]:
+    out, seen = [], set()
+    cutoff = datetime.utcnow() - timedelta(days=RECENCY_DAYS)
+    for q in QTERMS:
+        try:
+            # grab first page only (fast); increase if needed
+            data = _search_page(q, rows=80, start=0)
+            procs = data.get("procurements") or {}
+            rows = list(procs.values())
+            if DEBUG:
+                print(f"[worldbank] SEARCH q='{q}' -> rows {len(rows)}")
+            for n in rows:
+                item = _search_normalize(n)
+                d = _parse_date(item.get("deadline"))
+                if d and d < cutoff:
+                    continue
+                s = _sig(item)
+                if s in seen:
+                    continue
+                out.append(item); seen.add(s)
+                if len(out) >= max_items:
+                    return out
+            time.sleep(0.3)
+        except Exception as e:
+            if DEBUG:
+                print(f"[worldbank] SEARCH error for q='{q}': {e}")
             continue
-
-        norm = _normalize_row(row)
-        sig = hashlib.sha1(f"{norm.get('title','')}|{norm.get('url','')}|{norm.get('deadline','')}".encode("utf-8")).hexdigest()
-        if sig in seen:
-            continue
-        out.append(norm)
-        seen.add(sig)
-
-    if dropped_old and not out:
-        print(f"[worldbank] filtered out {dropped_old} old items; 0 recent remain (adjust RECENCY_DAYS or ordering).")
     return out
 
+# ---------- main ----------
+def fetch() -> List[Dict[str, str]]:
+    # 1) Try FinancesOne
+    items = _try_fone()
+    if items:
+        return items
+    # 2) Fallback to Search API
+    items = _try_search()
+    if DEBUG:
+        print(f"[worldbank] FALLBACK returned {len(items)} items")
+    return items
+
 if __name__ == "__main__":
-    items = fetch()
-    print(f"Fetched {len(items)} recent World Bank items.")
-    for it in items[:5]:
+    os.environ["WB_DEBUG"] = "1"
+    its = fetch()
+    print(f"Fetched {len(its)} World Bank items.")
+    for it in its[:5]:
         print("-", it["title"], "|", it["deadline"], "|", it["url"])
