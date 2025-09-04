@@ -1,4 +1,19 @@
 # connectors/worldbank.py
+# World Bank "Procurement Notices" — robust future-deadline filter with safe fallback
+# Uses observed fields from your logs:
+#   deadline  -> submission_date
+#   pub date  -> noticedate
+#   country   -> project_ctry_name
+#   title     -> project_name (fallback bid_description)
+#   desc      -> bid_description (fallback notice_text)
+#
+# Primary: return notices with deadline >= today (and not awards/drafts).
+# Fallback: if none, return most recent by noticedate (last 365 days), capped to 20.
+# Links: human-readable detail page on projects portal; fallback to API JSON if needed.
+#
+# Optional env:
+#   WB_DEBUG=1  -> print diagnostics in GitHub Actions logs
+
 from __future__ import annotations
 import os, hashlib
 from datetime import datetime, timedelta
@@ -80,17 +95,28 @@ def _extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     if DEBUG: print("[worldbank] normalize keys:", list(n.keys())[:15])
+
+    # observed fields
     title = (n.get("project_name") or n.get("bid_description") or "").strip()
-    desc = (n.get("bid_description") or n.get("notice_text") or "").strip()
+    desc  = (n.get("bid_description") or n.get("notice_text") or "").strip()
     country = (n.get("project_ctry_name") or "").strip()
     region0 = (n.get("regionname") or "").strip()
-    deadline_iso = _to_iso(n.get("submission_date"))
-    pub_iso = _to_iso(n.get("noticedate"))
+
+    # dates
+    deadline_iso = _to_iso(n.get("submission_date"))  # future-deadline filter uses this
+    pub_iso = _to_iso(n.get("noticedate"))            # fallback recency uses this
+
+    # human-readable detail page (preferred), then any API-provided URL, then JSON detail
     nid = str(n.get("id") or "").strip()
-    url = f"https://search.worldbank.org/api/v2/procnotices?id={nid}&format=html&apilang=en" if nid else ""
+    public_detail = f"https://projects.worldbank.org/en/projects-operations/procurement-detail/{nid}" if nid else ""
+    api_detail = f"https://search.worldbank.org/api/procnotices?id={nid}" if nid else ""
+    url_from_api = (n.get("url") or n.get("notice_url") or n.get("source_url") or "").strip()
+    url = public_detail or url_from_api or api_detail
+
     text = " ".join([title, desc, country, region0])
     region = _infer_region(text, region0)
     themes = ",".join(_themes_from_text(text))
+
     return {
         "title": title or "World Bank procurement notice",
         "url": url,
@@ -154,7 +180,7 @@ def fetch() -> List[Dict[str, str]]:
     if recent_pub_items:
         return recent_pub_items[:20]
 
-    # last-resort fallback: return 10 normalized items from first page (but still filtered for awards/drafts above)
+    # last-resort fallback: return 10 normalized items from first page (still excluding awards/drafts)
     try:
         payload = _fetch_page(0)
         rows = _extract_rows(payload)[:20]
