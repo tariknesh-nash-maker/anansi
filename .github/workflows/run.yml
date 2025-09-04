@@ -14,6 +14,7 @@ jobs:
       - run: python aggregator.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          WB_DEBUG: "1"
       - name: Persist state
         run: |
           git config user.email "bot@users.noreply.github.com"
