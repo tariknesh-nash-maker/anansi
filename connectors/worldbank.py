@@ -1,18 +1,11 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notices" — robust future-deadline filter with safe fallback
-# Uses observed fields from your logs:
-#   deadline  -> submission_date
+# World Bank "Procurement Notices" — future-deadline filter with safe fallback
+# Fields observed in logs:
+#   deadline  -> submission_date (sometimes ISO-8601 with 'T...Z')
 #   pub date  -> noticedate
 #   country   -> project_ctry_name
 #   title     -> project_name (fallback bid_description)
 #   desc      -> bid_description (fallback notice_text)
-#
-# Primary: return notices with deadline >= today (and not awards/drafts).
-# Fallback: if none, return most recent by noticedate (last 365 days), capped to 20.
-# Links: human-readable detail page on projects portal; fallback to API JSON if needed.
-#
-# Optional env:
-#   WB_DEBUG=1  -> print diagnostics in GitHub Actions logs
 
 from __future__ import annotations
 import os, hashlib
@@ -26,9 +19,17 @@ ROWS = 100
 PAGES = 10
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
-DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
+# Added ISO-8601 formats with 'T' and 'Z'
+DATE_FMTS = (
+    "%Y-%m-%d",
+    "%d-%b-%Y", "%d %b %Y",
+    "%m/%d/%Y", "%Y/%m/%d",
+    "%Y.%m.%d",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+)
 
-# opportunity filtering
+# Opportunity filtering
 ALLOW_TYPES = {
     "invitation for bids", "request for bids",
     "request for expressions of interest", "request for expression of interest",
@@ -96,17 +97,16 @@ def _extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     if DEBUG: print("[worldbank] normalize keys:", list(n.keys())[:15])
 
-    # observed fields
     title = (n.get("project_name") or n.get("bid_description") or "").strip()
     desc  = (n.get("bid_description") or n.get("notice_text") or "").strip()
     country = (n.get("project_ctry_name") or "").strip()
     region0 = (n.get("regionname") or "").strip()
 
     # dates
-    deadline_iso = _to_iso(n.get("submission_date"))  # future-deadline filter uses this
-    pub_iso = _to_iso(n.get("noticedate"))            # fallback recency uses this
+    deadline_iso = _to_iso(n.get("submission_date"))  # often ISO-8601
+    pub_iso = _to_iso(n.get("noticedate"))
 
-    # human-readable detail page (preferred), then any API-provided URL, then JSON detail
+    # Public detail page (preferred), then API-provided URL, then JSON detail
     nid = str(n.get("id") or "").strip()
     public_detail = f"https://projects.worldbank.org/en/projects-operations/procurement-detail/{nid}" if nid else ""
     api_detail = f"https://search.worldbank.org/api/procnotices?id={nid}" if nid else ""
@@ -132,9 +132,11 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
 def fetch() -> List[Dict[str, str]]:
     today = datetime.utcnow().date()
     recent_cutoff = datetime.utcnow() - timedelta(days=365)
+
     seen = set()
     future_items: List[Dict[str, str]] = []
     recent_pub_items: List[Dict[str, str]] = []
+    no_deadline_items: List[Dict[str, str]] = []  # for final fallback (never past deadlines)
 
     for i in range(PAGES):
         start = i * ROWS
@@ -160,40 +162,42 @@ def fetch() -> List[Dict[str, str]]:
 
             item = _normalize(raw)
             s = _sig(item)
-            if s in seen: continue
+            if s in seen: 
+                continue
             seen.add(s)
 
             dl = _parse_date(item.get("deadline"))
-            if dl and dl.date() >= today:
-                future_items.append(item)
-                continue
-
-            pub_dt = _parse_date(item.get("_pub"))
-            if pub_dt and pub_dt >= recent_cutoff:
-                recent_pub_items.append(item)
+            if dl:
+                if dl.date() >= today:
+                    future_items.append(item)
+                # else: past -> we never include
+            else:
+                # No deadline — save for final fallback if needed
+                recent_pub_items_candidate = False
+                pub_dt = _parse_date(item.get("_pub"))
+                if pub_dt and pub_dt >= recent_cutoff:
+                    recent_pub_items.append(item)
+                    recent_pub_items_candidate = True
+                if not recent_pub_items_candidate:
+                    no_deadline_items.append(item)
 
     if DEBUG:
-        print(f"[worldbank] future={len(future_items)} recent_pub={len(recent_pub_items)}")
+        print(f"[worldbank] future={len(future_items)} recent_pub={len(recent_pub_items)} no_deadline={len(no_deadline_items)}")
 
+    # Primary: future deadlines only
     if future_items:
         return future_items
+
+    # Fallback A: recently published (noticedate), regardless of deadline presence
     if recent_pub_items:
         return recent_pub_items[:20]
 
-    # last-resort fallback: return 10 normalized items from first page (still excluding awards/drafts)
-    try:
-        payload = _fetch_page(0)
-        rows = _extract_rows(payload)[:20]
-        fallback = []
-        for raw in rows:
-            nt = (str(raw.get("notice_type") or "")).lower()
-            ns = (str(raw.get("notice_status") or "")).lower()
-            if any(x in nt for x in DENY_TYPES) or ns in DENY_STATUS:
-                continue
-            fallback.append(_normalize(raw))
-        return fallback[:10]
-    except Exception:
-        return []
+    # Fallback B: if still empty, include items without a deadline field (but never past-deadline)
+    if no_deadline_items:
+        return no_deadline_items[:10]
+
+    # Last-resort: nothing found
+    return []
 
 if __name__ == "__main__":
     os.environ["WB_DEBUG"] = "1"
