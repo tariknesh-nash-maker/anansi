@@ -1,5 +1,5 @@
 # connectors/undp.py
-# UNDP Procurement Notices (legacy site) - robust HTML scrape with multiple list variants
+# UNDP Procurement Notices (legacy site) - robust HTML scrape with multiple list variants + deep debug
 from __future__ import annotations
 import os, re, hashlib, requests
 from html import unescape
@@ -16,7 +16,7 @@ VIEW_URL = BASE + "/view_notice.cfm?notice_id={nid}"
 
 TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.3; +https://example.org)",
+    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.4; +https://example.org)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.7",
     "Cache-Control": "no-cache",
@@ -42,23 +42,34 @@ CUTOFF: date = TODAY - timedelta(days=PUB_WINDOW_DAYS)
 
 # Date formats commonly seen on UNDP pages
 DATE_FMTS = (
-    # numeric first
     "%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d",
-    "%d-%b-%Y", "%d %b %Y",       # 02-Sep-2025 / 02 Sep 2025
-    "%d-%b-%y", "%d %b %y",       # 02-Sep-25 / 02 Sep 25
-    "%d %B %Y", "%d-%B-%Y",       # 02 September 2025 / 02-September-2025
-    "%B %d %Y", "%b %d %Y",       # September 2 2025 / Sep 2 2025
-    "%B %d, %Y", "%b %d, %Y",     # September 2, 2025 / Sep 2, 2025
+    "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%d %b %y",
+    "%d %B %Y", "%d-%B-%Y",
+    "%B %d %Y", "%b %d %Y",
+    "%B %d, %Y", "%b %d, %Y",
 )
 
-TAG_RE = re.compile(r"<[^>]+>")
-NID_ANY_RE = re.compile(r'view_notice\.cfm\?notice_id=(\d+)', re.I)
+TAG_RE      = re.compile(r"<[^>]+>")
+NID_ANY_RE  = re.compile(r'view_notice\.cfm\?notice_id=(\d+)', re.I)
 
+# Liberal capture of labels in plain text
 TITLE_RE    = re.compile(r'(?is)<h\d[^>]*>\s*(.+?)\s*</h\d>')
 COUNTRY_RE  = re.compile(r'(?i)^\s*(country|country of assignment)\s*:\s*(.+?)\s*$', re.M)
 POSTED_RE   = re.compile(r'(?i)^\s*(posted on|publication date|posted)\s*:\s*(.+?)\s*$', re.M)
 DEADLINE_RE = re.compile(r'(?i)^\s*(deadline|closing date|closing)\s*:\s*(.+?)\s*$', re.M)
 TYPE_RE     = re.compile(r'(?i)^\s*(procurement method|notice type|process|category)\s*:\s*(.+?)\s*$', re.M)
+
+# HTML-nearby regex (label ± 120 chars, then any non-< until next tag)
+HTML_LABEL_NEAR = {
+    "posted": re.compile(r'(?is)(posted on|publication date|posted)\s*[:\-]?\s*(.{0,120}?)(?:<|$)'),
+    "deadline": re.compile(r'(?is)(deadline|closing date|closing)\s*[:\-]?\s*(.{0,120}?)(?:<|$)'),
+}
+
+# Generic date token finder (broad)
+DATE_TOKEN_RE = re.compile(
+    r'(\d{4}-\d{2}-\d{2})|(\d{1,2}[ \-/][A-Za-z]{3,9}[ \-/]\d{2,4})|([A-Za-z]{3,9}\s+\d{1,2}(?:,)?\s+\d{2,4})',
+    re.I
+)
 
 def _strip_html(text: str) -> str:
     if not text: return ""
@@ -70,12 +81,16 @@ def _sentence_case(s: str) -> str:
     return s[0].upper() + s[1:]
 
 def _clean_date_string(s: str) -> str:
-    """Remove time/tz parts like '@ 05:00 PM (GMT+0)' keeping the first clear date token."""
-    s = s.strip().replace(",", " ")
-    # Pick an obvious date token (YYYY-MM-DD or '02 Sep 2025' or 'September 2 2025')
-    m = re.search(r'(\d{4}-\d{2}-\d{2})|(\d{1,2}[ \-/][A-Za-z]{3,}[ \-/]\d{2,4})|([A-Za-z]{3,}\s+\d{1,2}\s+\d{2,4})', s)
+    """Trim times/timezones like '@ 05:00 PM (GMT+0)' keeping an obvious date token."""
+    s = unescape(s or "").replace("&nbsp;", " ")
+    s = s.replace(",", " ").strip()
+    # Pick first clear date token
+    m = DATE_TOKEN_RE.search(s)
     if m:
-        s = next(g for g in m.groups() if g)  # first non-None group
+        for g in m.groups():
+            if g:
+                s = g
+                break
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -87,7 +102,7 @@ def _parse_date(s: Optional[str]) -> Optional[datetime]:
         try:
             dt = datetime.strptime(s, fmt)
             if dt.year < 100:
-                dt = dt.replace(year=2000 + dt.year)  # normalize 2-digit years
+                dt = dt.replace(year=2000 + dt.year)
             return dt
         except Exception:
             continue
@@ -169,23 +184,50 @@ def _parse_list(html: str) -> List[str]:
             seen.add(nid)
     return out
 
+def _extract_labelled_dates(html: str, text: str) -> Dict[str, str]:
+    """Try to pull posted/deadline using both text-line and HTML-near patterns."""
+    def find_line(rex: re.Pattern) -> str:
+        m = rex.search(text)
+        return m.group(2).strip() if m else ""
+    posted = find_line(POSTED_RE)
+    deadline = find_line(DEADLINE_RE)
+
+    if not posted:
+        m = HTML_LABEL_NEAR["posted"].search(html)
+        if m:
+            posted = _clean_date_string(m.group(2))
+    if not deadline:
+        m = HTML_LABEL_NEAR["deadline"].search(html)
+        if m:
+            deadline = _clean_date_string(m.group(2))
+
+    return {"posted": posted, "deadline": deadline}
+
 def _parse_detail(html: str) -> Dict[str, str]:
     text = _strip_html(html)
     m = TITLE_RE.search(html)
     title = _sentence_case(_strip_html(m.group(1))) if m else ""
+    # country/type via line labels
     def _line(rex: re.Pattern) -> str:
-        m = rex.search(text)
-        return m.group(2).strip() if m else ""
+        m = rex.search(text);  return m.group(2).strip() if m else ""
     country  = _line(COUNTRY_RE)
-    posted   = _line(POSTED_RE)
-    deadline = _line(DEADLINE_RE)
     ntype    = _line(TYPE_RE)
-    if not posted:
-        m = re.search(r'(?i)posted\s*on\s*[:\-]\s*([A-Za-z0-9, @:\-\(\)\/]+)', text)
-        if m: posted = m.group(1).strip()
-    if not deadline:
-        m = re.search(r'(?i)(deadline|closing date)\s*[:\-]\s*([A-Za-z0-9, @:\-\(\)\/]+)', text)
-        if m: deadline = m.group(2).strip()
+
+    dates = _extract_labelled_dates(html, text)
+    posted   = dates["posted"]
+    deadline = dates["deadline"]
+
+    # Fallback: if still empty, grab first 2 date-like tokens from page
+    if not posted or not deadline:
+        tokens = DATE_TOKEN_RE.findall(unescape(html))
+        tokens_flat = [g for tup in tokens for g in tup if g]
+        if not posted and tokens_flat:
+            posted = _clean_date_string(tokens_flat[0])
+        if not deadline and tokens_flat:
+            # pick the latest-looking token as a guess for deadline
+            cand = tokens_flat[-1]
+            deadline = _clean_date_string(cand)
+
     return {
         "title": title,
         "country": country,
@@ -196,11 +238,9 @@ def _parse_detail(html: str) -> Dict[str, str]:
     }
 
 def _in_window_or_future_deadline(pub_iso: str | None, deadline_iso: str | None) -> bool:
-    """Keep if (posted within window) OR (no posted but deadline is today/future)."""
     pub_dt = _parse_date(pub_iso) if pub_iso else None
     if pub_dt:
         return CUTOFF <= pub_dt.date() <= TODAY
-    # fallback: deadline criterion
     dl_dt = _parse_date(deadline_iso) if deadline_iso else None
     return bool(dl_dt and dl_dt.date() >= TODAY)
 
@@ -232,6 +272,8 @@ def fetch() -> List[Dict[str, str]]:
     detail_ok = 0
     dropped_old = dropped_no_pub = dropped_topics = dropped_qterm = 0
 
+    debug_samples_remaining = 8  # print detailed per-item debug for first few
+
     for page in range(1, PAGES + 1):
         nids: List[str] = []
         used_variant = ""
@@ -260,21 +302,32 @@ def fetch() -> List[Dict[str, str]]:
             seen_urls.add(url)
 
             try:
-                detail = _get(url)
+                detail_html = _get(url)
             except Exception as e:
                 if DEBUG: print(f"[undp] detail {nid} error: {e}")
                 continue
 
-            info = _parse_detail(detail)
+            info = _parse_detail(detail_html)
             country = info.get("country","").strip()
             base_title = info.get("title","").strip()
             ntype = info.get("type","").strip()
 
-            posted_iso_raw = info.get("posted","") or ""
-            deadline_iso_raw = info.get("deadline","") or ""
-            posted_iso = _to_iso(posted_iso_raw)
-            deadline_iso = _to_iso(deadline_iso_raw)
+            posted_raw = info.get("posted","") or ""
+            deadline_raw = info.get("deadline","") or ""
+            posted_iso = _to_iso(posted_raw)
+            deadline_iso = _to_iso(deadline_raw)
 
+            # Per-item deep debug (first N samples)
+            if DEBUG and debug_samples_remaining > 0:
+                snippet = _strip_html(detail_html)[:220].replace("\n"," ")
+                print(f"[undp][sample] url={url}")
+                print(f"[undp][sample] country='{country}' type='{ntype}' title='{base_title[:140]}'")
+                print(f"[undp][sample] posted_raw='{posted_raw}' -> posted_iso='{posted_iso}'")
+                print(f"[undp][sample] deadline_raw='{deadline_raw}' -> deadline_iso='{deadline_iso}'")
+                print(f"[undp][sample] text_snippet='{snippet}'")
+                debug_samples_remaining -= 1
+
+            # Build final item
             if base_title:
                 final_title = _sentence_case(base_title)
             elif ntype:
@@ -304,7 +357,6 @@ def fetch() -> List[Dict[str, str]]:
 
             # Filters + counters
             if not _in_window_or_future_deadline(item.get("_pub"), item.get("deadline")):
-                # diagnose: if both pub & deadline failed to parse, count as no_pub; else old
                 if not _parse_date(item.get("_pub")) and not _parse_date(item.get("deadline")):
                     dropped_no_pub += 1
                 else:
