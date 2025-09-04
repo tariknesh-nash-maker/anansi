@@ -1,12 +1,5 @@
 # connectors/undp.py
-# UNDP Procurement Notices (legacy site) - HTML scrape
-# - Scans listing pages on procurement-notices.undp.org
-# - Opens each notice detail page (view_notice.cfm?notice_id=XXXX)
-# - Extracts title, country, publication ("Posted on"), deadline, notice type
-# - Filters by publication_date within last N days (default 90)
-# - Tags OGP topics; optionally keeps only OGP-relevant notices
-# - Output is similar to other connectors: list[dict] with title/url/deadline/summary/region/themes
-
+# UNDP Procurement Notices (legacy site) - robust HTML scrape with multiple list variants
 from __future__ import annotations
 import os, re, hashlib, requests
 from html import unescape
@@ -14,16 +7,23 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 BASE = "https://procurement-notices.undp.org"
-LIST_URL = BASE + "/search.cfm"         # ?cur=<page> (1-based)
+LIST_URLS = [
+    BASE + "/search.cfm?cur={page}",   # classic
+    BASE + "/search.cfm?page={page}",  # alt param
+    BASE + "/search.cfm",              # sometimes page param unused; still returns latest
+]
 VIEW_URL = BASE + "/view_notice.cfm?notice_id={nid}"
 
 TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.0; +https://example.org)"
+    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.1; +https://example.org)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.7",
+    "Cache-Control": "no-cache",
 }
 
 # Tunables
-PAGES   = int(os.getenv("UNDP_PAGES", "6"))                 # number of newest list pages to scan
+PAGES   = int(os.getenv("UNDP_PAGES", "10"))
 DEBUG   = os.getenv("UNDP_DEBUG", "0") == "1"
 PUB_WINDOW_DAYS = int(os.getenv("UNDP_PUB_WINDOW_DAYS", "90"))
 MAX_RESULTS     = int(os.getenv("UNDP_MAX_RESULTS", "60"))
@@ -60,7 +60,6 @@ def _sentence_case(s: str) -> str:
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
     if not s: return None
     s = s.strip()
-    # normalize like "Posted on: 02-Sep-2025"
     s = re.sub(r"(?i)\b(posted on|publication date|posted)\s*:\s*", "", s)
     s = re.sub(r"(?i)\b(deadline|closing date|closing)\s*:\s*", "", s)
     for fmt in DATE_FMTS:
@@ -85,7 +84,7 @@ def _get(url: str, params: Dict[str, Any] | None = None) -> str:
     r.raise_for_status()
     return r.text
 
-# ----- Topic taxonomy (same approach you approved) -----
+# ----- Topic taxonomy (same as WB connector) -----
 TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "Access to Information": [
         "access to information","right to information","freedom of information","foi",
@@ -132,20 +131,17 @@ def _detect_topics(text: str) -> List[str]:
     for topic, kws in TOPIC_KEYWORDS.items():
         if any(kw in t for kw in kws):
             found.append(topic)
-    # de-dupe preserve order
     out: List[str] = []
     for x in found:
         if x not in out: out.append(x)
     return out
 
-# ----- Parsers -----
-
-# List page: look for links like view_notice.cfm?notice_id=XXXXX
-LINK_RE = re.compile(r'href\s*=\s*"(?P<href>/view_notice\.cfm\?notice_id=(?P<nid>\d+))"', re.I)
+# -------- Robust list parsing --------
+# Find ANY mention of view_notice.cfm?notice_id=NNNNN (abs/rel URL, single/double quotes, data-* attributes, JS)
+NID_ANY_RE = re.compile(r'view_notice\.cfm\?notice_id=(\d+)', re.I)
 
 def _parse_list(html: str) -> List[str]:
-    nids = [m.group("nid") for m in LINK_RE.finditer(html)]
-    # unique while preserving order
+    nids = NID_ANY_RE.findall(html)
     out, seen = [], set()
     for nid in nids:
         if nid not in seen:
@@ -153,8 +149,7 @@ def _parse_list(html: str) -> List[str]:
             seen.add(nid)
     return out
 
-# Detail page fields: title, country, posted, deadline, type
-# These pages are fairly consistent; we’ll match by label prefixes.
+# -------- Detail parsing --------
 TITLE_RE    = re.compile(r'(?is)<h\d[^>]*>\s*(.+?)\s*</h\d>')
 COUNTRY_RE  = re.compile(r'(?i)^\s*(country|country of assignment)\s*:\s*(.+?)\s*$', re.M)
 POSTED_RE   = re.compile(r'(?i)^\s*(posted on|publication date|posted)\s*:\s*(.+?)\s*$', re.M)
@@ -163,24 +158,15 @@ TYPE_RE     = re.compile(r'(?i)^\s*(procurement method|notice type|process|categ
 
 def _parse_detail(html: str) -> Dict[str, str]:
     text = _strip_html(html)
-    title = ""
     m = TITLE_RE.search(html)
-    if m:
-        title = _sentence_case(_strip_html(m.group(1)))
-    # find lines by labels
-    country = ""
-    posted = ""
-    deadline = ""
-    ntype = ""
-    m = COUNTRY_RE.search(text)
-    if m: country = m.group(2).strip()
-    m = POSTED_RE.search(text)
-    if m: posted = m.group(2).strip()
-    m = DEADLINE_RE.search(text)
-    if m: deadline = m.group(2).strip()
-    m = TYPE_RE.search(text)
-    if m: ntype = m.group(2).strip()
-    # Sometimes these labels are inside table rows; try secondary patterns
+    title = _sentence_case(_strip_html(m.group(1))) if m else ""
+    def _line(rex: re.Pattern) -> str:
+        m = rex.search(text)
+        return m.group(2).strip() if m else ""
+    country  = _line(COUNTRY_RE)
+    posted   = _line(POSTED_RE)
+    deadline = _line(DEADLINE_RE)
+    ntype    = _line(TYPE_RE)
     if not posted:
         m = re.search(r'(?i)posted\s*on\s*[:\-]\s*([A-Za-z0-9, \-\/]+)', text)
         if m: posted = m.group(1).strip()
@@ -193,57 +179,58 @@ def _parse_detail(html: str) -> Dict[str, str]:
         "posted": posted,
         "deadline": deadline,
         "type": ntype,
-        "summary": text[:1200],  # raw summary fallback (will be refined)
+        "summary": text[:1200],
     }
 
-# ----- Filters -----
-
+# -------- Filters --------
 def _in_window(pub_iso: str | None) -> bool:
     dt = _parse_date(pub_iso)
     return bool(dt and CUTOFF <= dt.date() <= TODAY)
 
 def _matches_qterm(item: Dict[str, str]) -> bool:
     pat = UNDP_QTERM
-    if not pat:
-        return True
-    # normalize OR-like syntax to pipes
+    if not pat: return True
     norm = (pat
-        .replace('"', ' ')
-        .replace("(", " ").replace(")", " ")
+        .replace('"', ' ').replace("(", " ").replace(")", " ")
         .replace(" or ", "|").replace(" OR ", "|").replace(" Or ", "|")
         .replace(",", "|"))
     tokens = [t.strip() for t in norm.split("|") if t.strip()]
-    if not tokens:
-        return True
+    if not tokens: return True
     hay = " ".join([item.get("title",""), item.get("summary",""), item.get("_type","")]).lower()
     return any(tok in hay for tok in tokens)
 
 def _matches_topics(item: Dict[str, str]) -> bool:
-    if not UNDP_REQUIRE_TOPIC_MATCH:
-        return True
+    if not UNDP_REQUIRE_TOPIC_MATCH: return True
     allowed = [t.strip() for t in UNDP_TOPIC_LIST.split("|") if t.strip()]
-    if not allowed:
-        return True
+    if not allowed: return True
     topics = [t.strip() for t in (item.get("themes","") or "").split(",") if t.strip()]
     return any(t in allowed for t in topics)
 
-# ----- Main -----
-
+# -------- Main --------
 def fetch() -> List[Dict[str, str]]:
-    seen_urls = set()
-    seen_sigs = set()
+    seen_urls, seen_sigs = set(), set()
     results: List[Dict[str, str]] = []
 
-    # Iterate newest list pages (usually ?cur=1 is newest)
     for page in range(1, PAGES + 1):
-        try:
-            html = _get(LIST_URL, params={"cur": page})
-        except Exception as e:
-            if DEBUG: print(f"[undp] list page {page} error: {e}")
-            continue
+        nids: List[str] = []
+        used_variant = ""
+        for variant in LIST_URLS:
+            url = variant.format(page=page)
+            try:
+                html = _get(url)
+            except Exception as e:
+                if DEBUG: print(f"[undp] list {url} error: {e}")
+                continue
+            ids = _parse_list(html)
+            if ids:
+                nids = ids
+                used_variant = url
+                break
+        if DEBUG:
+            print(f"[undp] page {page}: variant={used_variant or '(none)'} found {len(nids)} notice ids")
 
-        nids = _parse_list(html)
-        if DEBUG: print(f"[undp] page {page}: found {len(nids)} notice ids")
+        if not nids:
+            continue
 
         for nid in nids:
             url = VIEW_URL.format(nid=nid)
@@ -258,15 +245,12 @@ def fetch() -> List[Dict[str, str]]:
                 continue
 
             info = _parse_detail(detail)
-
-            # Build normalized item
             country = info.get("country","").strip()
             base_title = info.get("title","").strip()
             ntype = info.get("type","").strip()
             posted_iso = _to_iso(info.get("posted",""))
             deadline_iso = _to_iso(info.get("deadline",""))
 
-            # Clean title; prefix with country
             if base_title:
                 final_title = _sentence_case(base_title)
             elif ntype:
@@ -274,17 +258,10 @@ def fetch() -> List[Dict[str, str]]:
             else:
                 final_title = f"UNDP Notice {nid}"
 
-            if country:
-                title = f"{country} — {final_title}"
-            else:
-                title = final_title
-
-            # Compose summary
+            title = f"{country} — {final_title}" if country else final_title
             raw_summary = info.get("summary","").strip()
-            # If summary is huge, trim
             summary = raw_summary[:600] if raw_summary else (ntype or "Procurement notice")
 
-            # Topic tags (title + summary + type)
             topics = _detect_topics(" ".join([title, summary, ntype]))
             themes = ",".join(topics)
 
@@ -293,7 +270,7 @@ def fetch() -> List[Dict[str, str]]:
                 "url": url,
                 "deadline": deadline_iso,
                 "summary": summary,
-                "region": "",  # UNDP pages don’t always carry explicit region; can infer from country if needed
+                "region": "",
                 "themes": themes,
                 "_pub": posted_iso,
                 "_type": ntype,
@@ -301,7 +278,6 @@ def fetch() -> List[Dict[str, str]]:
                 "_nid": nid,
             }
 
-            # Filters
             if not _in_window(item.get("_pub")):
                 continue
             if not _matches_qterm(item):
@@ -309,7 +285,6 @@ def fetch() -> List[Dict[str, str]]:
             if not _matches_topics(item):
                 continue
 
-            # Dedup (URL first, then signature)
             sig = _sig(item)
             if sig in seen_sigs:
                 continue
@@ -323,7 +298,6 @@ def fetch() -> List[Dict[str, str]]:
     if DEBUG:
         print(f"[undp] emitted={len(results)} (window={PUB_WINDOW_DAYS}d, pages={PAGES})")
 
-    # Placeholder when none found (so Slack isn’t empty)
     if not results:
         return [{
             "title": f"No UNDP notices in the last {PUB_WINDOW_DAYS} days matching selected OGP topics",
