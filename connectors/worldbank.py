@@ -1,34 +1,33 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notices" — server-side sort (noticedate desc) + last-90-days filter
+# World Bank "Procurement Notices" — server-side sort by publication date (desc) + published-in-window filter
+# Strategy to unblock: pull newest first, keep anything published in the window (no type/status filters yet).
+# After data flows, re-add filters (awards, drafts) and narrow the window.
 
 import os, hashlib, requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
+from collections import Counter
 
 API = "https://search.worldbank.org/api/procnotices"
 TIMEOUT = 25
 
-# Tunables via env (no code changes needed)
-ROWS  = int(os.getenv("WB_ROWS", "100"))          # rows per page
-PAGES = int(os.getenv("WB_PAGES", "10"))          # how many pages to scan
+# Tunables (set via GitHub Actions env)
+ROWS  = int(os.getenv("WB_ROWS", "100"))                # rows per page
+PAGES = int(os.getenv("WB_PAGES", "10"))                # how many pages to scan
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
-# Publication window (default 90 days)
-PUB_WINDOW_DAYS = int(os.getenv("WB_PUB_WINDOW_DAYS", "90"))
+# Publication window — start with 180 to validate the pipe; you can drop to 90 later
+PUB_WINDOW_DAYS = int(os.getenv("WB_PUB_WINDOW_DAYS", "180"))
 PUB_CUTOFF = datetime.utcnow() - timedelta(days=PUB_WINDOW_DAYS)
 
-# Filter out non-opportunity noise
-DENY_TYPES  = {"contract award", "award"}
-DENY_STATUS = {"draft"}
-
-# Optional keyword bias (leave empty for all)
+# Optional keyword bias (leave empty initially to avoid over-filtering)
 QTERM = os.getenv("WB_QTERM", "").strip()
 
-# Server-side sort (can override via env if needed)
+# Server-side sort by publication date (observed field: noticedate)
 SRT_FIELD = os.getenv("WB_SRT_FIELD", "noticedate")
-SRT_ORDER = os.getenv("WB_SRT_ORDER", "desc")     # 'asc' or 'desc'
+SRT_ORDER = os.getenv("WB_SRT_ORDER", "desc")           # 'asc' or 'desc'
 
-# Max items to emit
+# How many items to emit
 MAX_RESULTS = int(os.getenv("WB_MAX_RESULTS", "40"))
 
 DATE_FMTS = (
@@ -61,8 +60,8 @@ def _fetch_page(start: int) -> Dict[str, Any]:
         "format": "json",
         "rows": ROWS,
         "start": start,
-        "srt": SRT_FIELD,     # ← sort by publication date
-        "order": SRT_ORDER,   # ← newest first
+        "srt": SRT_FIELD,             # ← sort by publication date
+        "order": SRT_ORDER,           # ← newest first
     }
     if QTERM:
         params["qterm"] = QTERM
@@ -83,7 +82,10 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     country = (n.get("project_ctry_name") or "").strip()
     region0 = (n.get("regionname") or "").strip()
 
-    pub_iso = _to_iso(n.get("noticedate") or n.get("pub_date") or n.get("publication_date") or n.get("posting_date"))
+    pub_iso = _to_iso(
+        n.get("noticedate") or n.get("pub_date") or
+        n.get("publication_date") or n.get("posting_date")
+    )
 
     nid = str(n.get("id") or "").strip()
     public_detail = f"https://projects.worldbank.org/en/projects-operations/procurement-detail/{nid}" if nid else ""
@@ -94,18 +96,21 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     return {
         "title": title or "World Bank procurement notice",
         "url": url,
-        "deadline": "",          # we filter by publish date only
+        "deadline": "",  # we’re not using deadline in this mode
         "summary": desc[:500],
         "region": region0,
         "themes": "",
         "_pub": pub_iso,
         "_type": (n.get("notice_type") or ""),
-        "_status": (n.get("notice_status") or "")
+        "_status": (n.get("notice_status") or ""),
     }
 
 def fetch() -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     seen = set()
+    type_counter = Counter()
+    status_counter = Counter()
+    first_page_pub_samples: List[str] = []
 
     for page in range(PAGES):
         start = page * ROWS
@@ -120,24 +125,26 @@ def fetch() -> List[Dict[str, str]]:
         if not rows:
             break
 
+        # Collect debug stats for the very first page
+        if page == 0:
+            for raw in rows[:10]:
+                pub_iso = _to_iso(raw.get("noticedate") or raw.get("pub_date") or raw.get("publication_date") or raw.get("posting_date"))
+                first_page_pub_samples.append(pub_iso or "(no pub date)")
+
         stop_due_to_old = False
 
         for raw in rows:
-            # basic filters
-            nt = (str(raw.get("notice_type") or "")).lower()
-            ns = (str(raw.get("notice_status") or "")).lower()
-            if any(x in nt for x in DENY_TYPES):   # skip awards
-                continue
-            if ns in DENY_STATUS:                  # skip drafts
-                continue
-
+            # no type/status filters here — we want to see *anything* in-window first
             item = _normalize(raw)
+
+            # debug counters
+            type_counter.update([str(item.get("_type","")).lower()])
+            status_counter.update([str(item.get("_status","")).lower()])
+
             pub_dt = _parse_date(item.get("_pub"))
             if not pub_dt:
                 continue
 
-            # If this item is older than cutoff, and we're sorted newest→oldest,
-            # the rest of this page (and following pages) will also be older.
             if pub_dt < PUB_CUTOFF:
                 stop_due_to_old = True
                 continue
@@ -149,23 +156,34 @@ def fetch() -> List[Dict[str, str]]:
 
             results.append(item)
             if len(results) >= MAX_RESULTS:
+                _maybe_log_debug(first_page_pub_samples, type_counter, status_counter, results)
                 return results
 
         if stop_due_to_old:
-            break  # we've crossed out of the 90-day window
+            break
 
-    if DEBUG: print(f"[worldbank] results={len(results)} within last {PUB_WINDOW_DAYS} days")
-    return results if results else _placeholder()
+    _maybe_log_debug(first_page_pub_samples, type_counter, status_counter, results)
 
-def _placeholder() -> List[Dict[str, str]]:
+    if results:
+        return results
+
+    # Explicit placeholder with diagnostics in DEBUG
     return [{
-        "title": f"No World Bank opportunities published in the last {PUB_WINDOW_DAYS} days (try widening window or pages)",
+        "title": f"No World Bank notices found with Published Date within last {PUB_WINDOW_DAYS} days",
         "url": "https://projects.worldbank.org/en/projects-operations/procurement",
         "deadline": "",
-        "summary": "Tip: set WB_PAGES=15 and/or WB_PUB_WINDOW_DAYS=180 in your workflow env.",
+        "summary": "Try increasing WB_PAGES (e.g., 20), widening WB_PUB_WINDOW_DAYS (e.g., 365), or removing WB_QTERM.",
         "region": "",
         "themes": "",
     }]
+
+def _maybe_log_debug(first_page_pub_samples, type_counter, status_counter, results):
+    if not DEBUG:
+        return
+    print(f"[worldbank] first-page pub samples: {first_page_pub_samples}")
+    print(f"[worldbank] notice_type histogram (top 10): {type_counter.most_common(10)}")
+    print(f"[worldbank] notice_status histogram (top 10): {status_counter.most_common(10)}")
+    print(f"[worldbank] emitted={len(results)}")
 
 if __name__ == "__main__":
     os.environ["WB_DEBUG"] = "1"
