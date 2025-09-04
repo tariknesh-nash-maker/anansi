@@ -38,7 +38,7 @@ jobs:
           UNDP_PAGES: "10"             # how many newest listing pages to scan
           UNDP_PUB_WINDOW_DAYS: "90"   # use 180–365 for more volume if needed
           UNDP_MAX_RESULTS: "60"
-          UNDP_REQUIRE_TOPIC_MATCH: "1"
+          UNDP_REQUIRE_TOPIC_MATCH: "0"
           UNDP_TOPIC_LIST: "Access to Information|Anti-Corruption|Civic Space|Climate and Environment|Digital Governance|Fiscal Openness|Gender and Inclusion|Justice|Media Freedom|Public Participation"
           UNDP_QTERM: ""               # optional extra filter (pipe-separated): e.g., "rfp|eoi|open data|beneficial ownership"
 
