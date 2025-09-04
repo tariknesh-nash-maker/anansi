@@ -119,4 +119,51 @@ def _fetch_page(qterm: str, rows: int = 50, start: int = 0) -> Dict:
     if start:
         params["start"] = start
     r = requests.get(WB_API, params=params, timeout=30)
-    r.raise_for_st
+    r.raise_for_status()
+    return r.json()
+
+def _iter_query(qterm: str, max_results: int = 120) -> List[Dict]:
+    items = []
+    start = 0
+    while len(items) < max_results:
+        data = _fetch_page(qterm, rows=50, start=start)
+        # API returns {"status":"OK","total":N,"procurements":{id:{...}, id2:{...}}}
+        procs = data.get("procurements") or {}
+        if not procs:
+            break
+        batch = list(procs.values())
+        items.extend(batch)
+        start += len(batch)
+        # stop if we've read all
+        total = data.get("total") or len(items)
+        if start >= total:
+            break
+        time.sleep(0.5)  # be polite
+    return items
+
+def fetch() -> List[Dict]:
+    # Aggregate across qterms; dedupe by URL/title
+    seen = set()
+    out: List[Dict] = []
+    for q in QUERY_TERMS:
+        try:
+            raw_items = _iter_query(q)
+        except Exception as e:
+            print(f"[worldbank] query failed: {q} -> {e}")
+            continue
+        for n in raw_items:
+            norm = _normalize_notice(n)
+            sig = hashlib.sha1(f"{norm.get('title','')}|{norm.get('url','')}".encode("utf-8")).hexdigest()
+            if sig in seen:
+                continue
+            # Simple region filter for MVP: keep Africa/MENA/target countries if present;
+            # if region unknown, still include (the aggregator will post; you can refine later).
+            text_for_region = " ".join([norm.get("summary",""), n.get("countryname","") or ""])
+            if any(k.lower() in text_for_region.lower() for k in [c.lower() for c in REGION_KEYWORDS]) or norm.get("region"):
+                out.append(norm)
+                seen.add(sig)
+            else:
+                # Keep some global calls (optional). Comment out next two lines to only keep regional.
+                out.append(norm)
+                seen.add(sig)
+    return out
