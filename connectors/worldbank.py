@@ -1,5 +1,5 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notices" — future-deadline first, resilient fallbacks (never empty)
+# World Bank "Procurement Notices" — future-deadline only, safe fallbacks (no past deadlines ever)
 
 from __future__ import annotations
 import os, hashlib
@@ -13,7 +13,7 @@ ROWS = int(os.getenv("WB_ROWS", "100"))     # per page
 PAGES = int(os.getenv("WB_PAGES", "10"))    # widen via env if needed
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
-# date formats incl. ISO-8601 + common timestamp strings seen in WB data
+# Date formats incl. ISO-8601 + common WB timestamp strings
 DATE_FMTS = (
     "%Y-%m-%d",
     "%d-%b-%Y", "%d %b %Y",
@@ -25,13 +25,13 @@ DATE_FMTS = (
     "%Y/%m/%d %H:%M:%S.%f",
 )
 
-# filtering
-DENY_TYPES = {"contract award", "award"}  # always skip awards in Pass A/B
-DENY_STATUS = {"draft"}                   # only skip obvious drafts; keep others
+# Filtering
+DENY_TYPES = {"contract award", "award"}  # always skip awards
+DENY_STATUS = {"draft"}                   # skip obvious drafts
 
-# fallback windows (tunable via env)
-RECENT_PUB_DAYS_PASSB = int(os.getenv("WB_RECENT_PUB_DAYS", "1825"))  # 5 years
-FINAL_MAX = 20  # cap fallback list sizes
+# Fallback windows (tunable)
+RECENT_PUB_DAYS = int(os.getenv("WB_RECENT_PUB_DAYS", "1095"))  # 3 years
+FALLBACK_MAX = 20
 
 def _parse_date(val: Optional[str]) -> Optional[datetime]:
     if not val:
@@ -76,7 +76,7 @@ def _sig(item: Dict[str, str]) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _fetch_page(start: int) -> Dict[str, Any]:
-    # request full schema (no 'fl' param); API returns dict with 'procnotices' or 'procurements'
+    # Request full schema (no 'fl'); API returns dict with 'procnotices' or 'procurements'
     params = {"format": "json", "rows": ROWS, "start": start}
     r = requests.get(API, params=params, timeout=TIMEOUT)
     r.raise_for_status()
@@ -92,23 +92,23 @@ def _extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     if DEBUG: print("[worldbank] normalize keys:", list(n.keys())[:15])
 
-    # title/desc from observed keys
+    # Title/desc from observed keys
     title = (n.get("project_name") or n.get("bid_description") or "").strip()
     desc  = (n.get("bid_description") or n.get("notice_text") or "").strip()
     country = (n.get("project_ctry_name") or "").strip()
     region0 = (n.get("regionname") or "").strip()
 
-    # deadline: check several possible fields
+    # Deadline: check several possible fields
     deadline_raw = (
         n.get("submission_date") or n.get("closing_date") or
         n.get("bid_deadline") or n.get("deadline_date") or n.get("deadline")
     )
     deadline_iso = _to_iso(deadline_raw)
 
-    # publication date
+    # Publication date
     pub_iso = _to_iso(n.get("noticedate") or n.get("pub_date") or n.get("publication_date") or n.get("posting_date"))
 
-    # human-readable detail page (preferred), then API-provided URL, then JSON detail
+    # Human-readable detail page (preferred), then API-provided URL, then JSON detail
     nid = str(n.get("id") or "").strip()
     public_detail = f"https://projects.worldbank.org/en/projects-operations/procurement-detail/{nid}" if nid else ""
     api_detail = f"https://search.worldbank.org/api/procnotices?id={nid}" if nid else ""
@@ -122,7 +122,7 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     return {
         "title": title or "World Bank procurement notice",
         "url": url,
-        "deadline": deadline_iso,            # may be "", but never past if we include it
+        "deadline": deadline_iso,            # may be "", but we will never emit a past date
         "summary": desc[:500],
         "region": region,
         "themes": themes,
@@ -133,15 +133,13 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
 
 def fetch() -> List[Dict[str, str]]:
     today = datetime.utcnow().date()
-    pub_cutoff_passb = datetime.utcnow() - timedelta(days=RECENT_PUB_DAYS_PASSB)
+    pub_cutoff = datetime.utcnow() - timedelta(days=RECENT_PUB_DAYS)
 
     seen = set()
-    # Pass A (strict)
-    future_items: List[Dict[str, str]] = []
-    # Pass B (relaxed, but no awards)
-    recent_pub_items: List[Dict[str, str]] = []
-    # Data for last-resort
-    first_page_raw: List[Dict[str, Any]] = []
+    future_items: List[Dict[str, str]] = []         # Tier 1
+    recent_nodl_items: List[Dict[str, str]] = []    # Tier 2: NO deadline, but recent publish
+    # Collect first page (for diagnostics only)
+    first_page_rows: List[Dict[str, Any]] = []
 
     for i in range(PAGES):
         start = i * ROWS
@@ -155,17 +153,14 @@ def fetch() -> List[Dict[str, str]]:
         if DEBUG: print(f"[worldbank] page {i+1}: rows={len(rows)}")
         if not rows: break
         if i == 0:
-            first_page_raw = rows[:]
+            first_page_rows = rows[:]
 
         for raw in rows:
             nt = (str(raw.get("notice_type") or "")).lower()
             ns = (str(raw.get("notice_status") or "")).lower()
-
-            # Always skip awards for A/B passes
-            if any(x in nt for x in DENY_TYPES):
+            if any(x in nt for x in DENY_TYPES):     # skip awards
                 continue
-            # Only skip obvious drafts
-            if ns in DENY_STATUS:
+            if ns in DENY_STATUS:                    # skip drafts
                 continue
 
             item = _normalize(raw)
@@ -174,49 +169,39 @@ def fetch() -> List[Dict[str, str]]:
                 continue
             seen.add(s)
 
-            # PASS A: future deadline only
+            # Strict: future deadline only
             dl = _parse_date(item.get("deadline"))
-            if dl and dl.date() >= today:
-                future_items.append(item)
+            if dl:
+                if dl.date() >= today:
+                    future_items.append(item)
+                # if past, drop it (never emit past deadlines)
                 continue
 
-            # PASS B pool: recently published (even if no deadline / past)
+            # No deadline: allow only if recently published (noticedate)
             pub_dt = _parse_date(item.get("_pub"))
-            if pub_dt and pub_dt >= pub_cutoff_passb:
-                recent_pub_items.append(item)
+            if pub_dt and pub_dt >= pub_cutoff:
+                recent_nodl_items.append(item)
 
     if DEBUG:
-        print(f"[worldbank] future(A)={len(future_items)} recent_pub(B)={len(recent_pub_items)}")
+        print(f"[worldbank] future={len(future_items)} recent_no_deadline={len(recent_nodl_items)}")
 
-    # Pass A result
+    # Tier 1 — Future deadlines only
     if future_items:
         return future_items
 
-    # Pass B result (no awards, recent publications up to 5y)
-    if recent_pub_items:
-        return recent_pub_items[:FINAL_MAX]
+    # Tier 2 — No deadline but recently published (never past-deadline)
+    if recent_nodl_items:
+        return recent_nodl_items[:FALLBACK_MAX]
 
-    # Last-resort: return first 12 items from page 1 with *all* filters off (so Slack isn't empty)
-    # NOTE: These might include awards; this tier is only used when A & B found nothing.
-    if first_page_raw:
-        out: List[Dict[str, str]] = []
-        seen2 = set()
-        for raw in first_page_raw[:50]:  # sample a bit more to avoid all-award edge cases
-            item = _normalize(raw)
-            s = _sig(item)
-            if s in seen2:
-                continue
-            # Explicitly *do not* enforce deadline/type/status here
-            out.append(item)
-            seen2.add(s)
-            if len(out) >= 12:
-                break
-        if out:
-            if DEBUG: print("[worldbank] returning last-resort fallback (unfiltered) items:", len(out))
-            return out
-
-    # Truly nothing
-    return []
+    # Tier 3 — Synthetic placeholder so Slack isn't empty (explicitly says none found)
+    return [{
+        "title": "No current World Bank opportunities with future deadlines were found in the latest window",
+        "url": "https://projects.worldbank.org/en/projects-operations/procurement",
+        "deadline": "",
+        "summary": "Tip: widen WB_PAGES or run again later; you can also rely on UNDP, EU, AfDB connectors for more fresh items.",
+        "region": "",
+        "themes": "ai_digital",
+    }]
 
 if __name__ == "__main__":
     os.environ["WB_DEBUG"] = "1"
