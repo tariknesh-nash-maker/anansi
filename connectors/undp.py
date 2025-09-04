@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os, re, hashlib, requests
 from html import unescape
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Any, Optional
 
 BASE = "https://procurement-notices.undp.org"
@@ -16,7 +16,7 @@ VIEW_URL = BASE + "/view_notice.cfm?notice_id={nid}"
 
 TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.2; +https://example.org)",
+    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.3; +https://example.org)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.7",
     "Cache-Control": "no-cache",
@@ -37,15 +37,18 @@ UNDP_REQUIRE_TOPIC_MATCH = os.getenv("UNDP_REQUIRE_TOPIC_MATCH", "1") == "1"
 # Optional free-text keyword filter (pipe-separated); leave empty to disable
 UNDP_QTERM = os.getenv("UNDP_QTERM", "").strip().lower()
 
-TODAY  = datetime.utcnow().date()
-CUTOFF = TODAY - timedelta(days=PUB_WINDOW_DAYS)
+TODAY: date  = datetime.utcnow().date()
+CUTOFF: date = TODAY - timedelta(days=PUB_WINDOW_DAYS)
 
 # Date formats commonly seen on UNDP pages
 DATE_FMTS = (
-    "%d-%b-%Y", "%d %b %Y", "%Y-%m-%d",
-    "%m/%d/%Y", "%Y/%m/%d",
-    "%d-%b-%y", "%d %b %y",        # 2-digit year
-    "%d %B %Y", "%d-%B-%Y",        # full month
+    # numeric first
+    "%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d",
+    "%d-%b-%Y", "%d %b %Y",       # 02-Sep-2025 / 02 Sep 2025
+    "%d-%b-%y", "%d %b %y",       # 02-Sep-25 / 02 Sep 25
+    "%d %B %Y", "%d-%B-%Y",       # 02 September 2025 / 02-September-2025
+    "%B %d %Y", "%b %d %Y",       # September 2 2025 / Sep 2 2025
+    "%B %d, %Y", "%b %d, %Y",     # September 2, 2025 / Sep 2, 2025
 )
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -67,14 +70,13 @@ def _sentence_case(s: str) -> str:
     return s[0].upper() + s[1:]
 
 def _clean_date_string(s: str) -> str:
-    """Remove timezones, times, and fluff like '@ 05:00 PM (GMT+0)'."""
-    s = s.strip()
-    # Keep only the first date-like token; strip trailing time/zone
-    m = re.search(r'(\d{1,2}[ \-/](?:[A-Za-z]{3,}|[0-9]{1,2})[ \-/]\d{2,4}|\d{4}-\d{2}-\d{2})', s)
+    """Remove time/tz parts like '@ 05:00 PM (GMT+0)' keeping the first clear date token."""
+    s = s.strip().replace(",", " ")
+    # Pick an obvious date token (YYYY-MM-DD or '02 Sep 2025' or 'September 2 2025')
+    m = re.search(r'(\d{4}-\d{2}-\d{2})|(\d{1,2}[ \-/][A-Za-z]{3,}[ \-/]\d{2,4})|([A-Za-z]{3,}\s+\d{1,2}\s+\d{2,4})', s)
     if m:
-        s = m.group(1)
-    s = s.replace(",", " ").strip()
-    s = re.sub(r"\s+", " ", s)
+        s = next(g for g in m.groups() if g)  # first non-None group
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
@@ -84,9 +86,8 @@ def _parse_date(s: Optional[str]) -> Optional[datetime]:
     for fmt in DATE_FMTS:
         try:
             dt = datetime.strptime(s, fmt)
-            # Normalize 2-digit year into 2000s if needed
             if dt.year < 100:
-                dt = dt.replace(year=2000 + dt.year)
+                dt = dt.replace(year=2000 + dt.year)  # normalize 2-digit years
             return dt
         except Exception:
             continue
@@ -194,9 +195,14 @@ def _parse_detail(html: str) -> Dict[str, str]:
         "summary": text[:1200],
     }
 
-def _in_window(pub_iso: str | None) -> bool:
-    dt = _parse_date(pub_iso)
-    return bool(dt and CUTOFF <= dt.date() <= TODAY)
+def _in_window_or_future_deadline(pub_iso: str | None, deadline_iso: str | None) -> bool:
+    """Keep if (posted within window) OR (no posted but deadline is today/future)."""
+    pub_dt = _parse_date(pub_iso) if pub_iso else None
+    if pub_dt:
+        return CUTOFF <= pub_dt.date() <= TODAY
+    # fallback: deadline criterion
+    dl_dt = _parse_date(deadline_iso) if deadline_iso else None
+    return bool(dl_dt and dl_dt.date() >= TODAY)
 
 def _matches_qterm(item: Dict[str, str]) -> bool:
     pat = UNDP_QTERM
@@ -269,9 +275,6 @@ def fetch() -> List[Dict[str, str]]:
             posted_iso = _to_iso(posted_iso_raw)
             deadline_iso = _to_iso(deadline_iso_raw)
 
-            # Fallback: if no Posted date, use Deadline as publication reference
-            pub_ref_iso = posted_iso or deadline_iso
-
             if base_title:
                 final_title = _sentence_case(base_title)
             elif ntype:
@@ -293,15 +296,19 @@ def fetch() -> List[Dict[str, str]]:
                 "summary": summary,
                 "region": "",
                 "themes": themes,
-                "_pub": pub_ref_iso,     # <- use posted if present; else deadline
+                "_pub": posted_iso,      # may be empty
                 "_type": ntype,
                 "_country": country,
                 "_nid": nid,
             }
 
             # Filters + counters
-            if not _in_window(item.get("_pub")):
-                dropped_old += 1
+            if not _in_window_or_future_deadline(item.get("_pub"), item.get("deadline")):
+                # diagnose: if both pub & deadline failed to parse, count as no_pub; else old
+                if not _parse_date(item.get("_pub")) and not _parse_date(item.get("deadline")):
+                    dropped_no_pub += 1
+                else:
+                    dropped_old += 1
                 continue
             if UNDP_QTERM and not _matches_qterm(item):
                 dropped_qterm += 1
@@ -319,16 +326,16 @@ def fetch() -> List[Dict[str, str]]:
             detail_ok += 1
             if len(results) >= MAX_RESULTS:
                 if DEBUG:
-                    print(f"[undp] reached MAX_RESULTS={MAX_RESULTS} (ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_qterm={dropped_qterm}, no_topic={dropped_topics})")
+                    print(f"[undp] reached MAX_RESULTS={MAX_RESULTS} (ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_pub={dropped_no_pub}, no_qterm={dropped_qterm}, no_topic={dropped_topics})")
                 return results
 
     if DEBUG:
         print(f"[undp] emitted={len(results)} (window={PUB_WINDOW_DAYS}d, pages={PAGES}) "
-              f"[ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_qterm={dropped_qterm}, no_topic={dropped_topics}]")
+              f"[ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_pub={dropped_no_pub}, no_qterm={dropped_qterm}, no_topic={dropped_topics}]")
 
     if not results:
         return [{
-            "title": f"No UNDP notices in the last {PUB_WINDOW_DAYS} days matching selected OGP topics",
+            "title": f"No UNDP notices in the last {PUB_WINDOW_DAYS} days (or with future deadlines) matching selected OGP topics",
             "url": BASE,
             "deadline": "",
             "summary": "Try increasing UNDP_PAGES, widening UNDP_PUB_WINDOW_DAYS, or relaxing UNDP_TOPIC_LIST / UNDP_REQUIRE_TOPIC_MATCH.",
