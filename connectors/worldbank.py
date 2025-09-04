@@ -1,39 +1,23 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notices" — recent & future-deadline items (with safe fallback).
+# World Bank "Procurement Notices" (official API) — future-deadline items with safe fallback.
 #
-# What this does:
-#   1) Queries the official World Bank "procnotices" API.
-#   2) Collects a recent slice (first ~400 items) across a few broad queries.
-#   3) Filters to notices with deadline >= today.
-#   4) If none found, falls back to "recently published" (pub_date in last 365 days) so result is not empty.
+# Primary: return notices with deadline >= today.
+# Fallback: if none, return first 20 items so Slack isn't empty.
 #
-# Output per item: {title, url, deadline, summary, region, themes}
-#
-# No environment variables required.
+# Env (optional):
+#   WB_DEBUG=1  -> print debug info
 
 from __future__ import annotations
-import hashlib
-from datetime import datetime, timedelta
+import os, hashlib
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 import requests
 
+API = "https://search.worldbank.org/api/procnotices"
 TIMEOUT = 25
-API = "https://search.worldbank.org/api/procnotices"  # official WB endpoint
-ROWS_PER_PAGE = 100
-MAX_PAGES = 4               # ~400 rows total (fast enough for MVP)
-RECENT_DAYS_FALLBACK = 365  # if no future-deadline items, keep notices published in last N days
-
-# Broad queries; API accepts qterm, but empty/space also works in practice
-QTERMS = [
-    "",                      # everything (first page of recency ordering on WB side)
-    "governance OR transparency OR anti-corruption OR procurement",
-    "budget OR public finance OR fiscal",
-    "digital OR data protection OR cybersecurity OR AI",
-    "parliament OR legislative",
-    "climate OR adaptation OR resilience"
-]
-
-# --------------------------------- helpers ---------------------------------
+ROWS = 100         # per page
+PAGES = 4          # total ~400 items
+DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
 DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
 
@@ -88,20 +72,11 @@ def _sig(item: Dict[str, str]) -> str:
     base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-def _pick(d: Dict[str, Any], keys: List[str]) -> str:
-    for k in keys:
-        if k in d and d[k]:
-            return str(d[k]).strip()
-    return ""
-
-# --------------------------------- API calls ---------------------------------
-
-def _fetch_page(qterm: str, start: int = 0, rows: int = ROWS_PER_PAGE) -> Dict[str, Any]:
-    # Fields known to appear: title, url, deadline, description, countryname, regionname, pub_date
+def _fetch_page(start: int) -> Dict[str, Any]:
+    # No qterm → broad recent slice. We request the fields we care about.
     params = {
         "format": "json",
-        "qterm": qterm,
-        "rows": rows,
+        "rows": ROWS,
         "start": start,
         "fl": "title,url,deadline,description,countryname,regionname,pub_date"
     }
@@ -115,8 +90,6 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     desc = (n.get("description") or "").strip()
     country = (n.get("countryname") or "").strip()
     region0 = (n.get("regionname") or "").strip()
-
-    # Deadline is the reliable "currentness" filter
     deadline = _to_iso(n.get("deadline") or "")
 
     text = " ".join([title, desc, country, region0])
@@ -132,62 +105,59 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
         "themes": themes
     }
 
-# --------------------------------- main fetch ---------------------------------
-
 def fetch() -> List[Dict[str, str]]:
-    """
-    Returns notices with deadline >= today.
-    If none, returns notices published in last RECENT_DAYS_FALLBACK days (even if no deadline).
-    """
     today = datetime.utcnow().date()
-    fallback_cutoff = datetime.utcnow() - timedelta(days=RECENT_DAYS_FALLBACK)
-
     seen = set()
-    future_deadline_items: List[Dict[str, str]] = []
-    recent_pub_items: List[Dict[str, str]] = []
+    future_items: List[Dict[str, str]] = []
+    fallback_items: List[Dict[str, str]] = []
 
-    # Pull a recent slice across a few qterms (first N pages each)
-    for q in QTERMS:
-        start = 0
-        pages = 0
-        while pages < MAX_PAGES:
-            data = _fetch_page(q, start=start, rows=ROWS_PER_PAGE)
-            procs = data.get("procnotices") or data.get("procurements") or {}
-            rows = list(procs.values())
-            if not rows:
-                break
+    total_rows = 0
+    for i in range(PAGES):
+        start = i * ROWS
+        try:
+            payload = _fetch_page(start)
+        except Exception as e:
+            if DEBUG:
+                print(f"[worldbank] fetch page start={start} error: {e}")
+            break
 
-            for raw in rows:
-                item = _normalize(raw)
-                sig = _sig(item)
-                if sig in seen:
-                    continue
-                seen.add(sig)
+        # The API usually returns dicts under "procnotices", but we also handle "procurements"
+        block = payload.get("procnotices") or payload.get("procurements") or {}
+        rows = list(block.values())
+        total_rows += len(rows)
+        if DEBUG:
+            print(f"[worldbank] page {i+1}: {len(rows)} rows")
 
-                # keep if deadline >= today
-                dl = _parse_date(item.get("deadline"))
-                if dl and dl.date() >= today:
-                    future_deadline_items.append(item)
-                    continue
+        if not rows:
+            break
 
-                # build fallback bucket: recently published, even if deadline missing/past
-                pub_dt = _parse_date(_pick(raw, ["pub_date", "publication_date", "published_on", "posting_date", "post_date"]))
-                if pub_dt and pub_dt >= fallback_cutoff:
-                    recent_pub_items.append(item)
+        for raw in rows:
+            item = _normalize(raw)
+            s = _sig(item)
+            if s in seen:
+                continue
+            seen.add(s)
 
-            # pagination
-            pages += 1
-            start += ROWS_PER_PAGE
+            # keep if deadline >= today
+            dl = _parse_date(item.get("deadline"))
+            if dl and dl.date() >= today:
+                future_items.append(item)
+            else:
+                # stash for fallback if we end up with no future deadlines
+                fallback_items.append(item)
 
-    # Primary requirement: only future deadlines
-    if future_deadline_items:
-        return future_deadline_items
+    if DEBUG:
+        print(f"[worldbank] scanned ~{total_rows} rows, future_deadlines={len(future_items)}, fallback={len(fallback_items)}")
 
-    # Fallback: don't return empty — send recent publications if no future deadlines found
-    # (you can cap to first 20 to avoid long Slack messages)
-    return recent_pub_items[:20]
+    # Primary requirement: future deadlines only
+    if future_items:
+        return future_items
+
+    # Fallback: do not return empty — send first 20 items so Slack shows something
+    return fallback_items[:20]
 
 if __name__ == "__main__":
+    os.environ["WB_DEBUG"] = "1"
     items = fetch()
     print(f"Fetched {len(items)} items")
     for it in items[:5]:
