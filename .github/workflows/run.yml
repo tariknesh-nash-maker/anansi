@@ -1,0 +1,23 @@
+name: funding-watcher
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: python aggregator.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Persist state
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "funding-watcher-bot"
+          git add state.json || true
+          git commit -m "update state $(date -u +'%F %T')" || echo "no changes"
+          git push || echo "no push (likely no changes)"
