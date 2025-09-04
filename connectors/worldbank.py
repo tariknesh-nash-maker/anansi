@@ -72,13 +72,14 @@ def _sig(item: Dict[str, str]) -> str:
     base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
+# ---------------- UPDATED: fetch page without 'fl' so we get all fields ----------------
 def _fetch_page(start: int) -> Dict[str, Any] | List[Any]:
-    # Broad slice; request common fields but also be ready for extra keys.
+    # Request a broad slice; do NOT restrict fields so we can see actual keys.
     params = {
         "format": "json",
         "rows": ROWS,
         "start": start,
-        "fl": "title,url,deadline,description,countryname,regionname,pub_date"
+        # no 'fl' here on purpose
     }
     r = requests.get(API, params=params, timeout=TIMEOUT)
     r.raise_for_status()
@@ -86,13 +87,14 @@ def _fetch_page(start: int) -> Dict[str, Any] | List[Any]:
 
 def _detect_date_fields(obj: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
-    Some records use different field names. Try official ones first, then scan.
+    Try official names first, then heuristics:
     Returns {'deadline': <raw>, 'published': <raw>} (strings or None).
     """
     # Preferred keys
-    deadline_raw = obj.get("deadline")
+    deadline_raw = obj.get("deadline") or obj.get("bid_deadline") or obj.get("closing_date")
     pub_raw = (obj.get("pub_date") or obj.get("publication_date") or
-               obj.get("published_on") or obj.get("posting_date") or obj.get("post_date"))
+               obj.get("published_on") or obj.get("posting_date") or obj.get("post_date") or
+               obj.get("issue_date") or obj.get("advertisement_date") or obj.get("last_update"))
 
     # Heuristic scan over keys
     if not deadline_raw:
@@ -107,15 +109,22 @@ def _detect_date_fields(obj: Dict[str, Any]) -> Dict[str, Optional[str]]:
             if ("pub" in kl or "post" in kl or "issue" in kl or "advert" in kl or "update" in kl) and isinstance(v, str):
                 pub_raw = v
                 break
-
     return {"deadline": deadline_raw, "published": pub_raw}
 
+# ---------------- UPDATED: normalize to adapt to whatever keys exist ----------------
 def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
-    title = (n.get("title") or "").strip()
-    url = (n.get("url") or "").strip()
-    desc = (n.get("description") or "").strip()
-    country = (n.get("countryname") or "").strip()
-    region0 = (n.get("regionname") or "").strip()
+    if DEBUG:
+        print("[worldbank] normalize keys:", list(n.keys())[:15])
+
+    title = (
+        (n.get("title") or n.get("notice_title") or n.get("tender_title") or n.get("subject") or "")
+        or str(n.get("project_id") or "")
+    ).strip()
+
+    url = (n.get("url") or n.get("notice_url") or n.get("source_url") or "").strip()
+    desc = (n.get("description") or n.get("notice_description") or n.get("tender_description") or "").strip()
+    country = (n.get("countryname") or n.get("country") or "").strip()
+    region0 = (n.get("regionname") or n.get("region") or "").strip()
 
     dates = _detect_date_fields(n)
     deadline = _to_iso(dates["deadline"])
@@ -137,25 +146,16 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
 
 def _extract_rows(payload: Dict[str, Any] | List[Any]) -> List[Dict[str, Any]]:
     """
-    The API sometimes returns:
-      - dict with 'procnotices' (dict) or 'procurements' (dict)
-      - dict with 'data' (list)
-      - or a top-level list
-    Normalize all cases into a list of dicts.
+    Normalize payload shapes to a list of dicts.
     """
     if isinstance(payload, list):
-        # top-level list
         return [r for r in payload if isinstance(r, dict)]
-
-    # dict payload:
     for key in ("procnotices", "procurements", "data", "rows"):
         block = payload.get(key)
         if isinstance(block, dict):
             return list(block.values())
         if isinstance(block, list):
             return [r for r in block if isinstance(r, dict)]
-
-    # last resort: if payload itself looks like a single record
     return [payload] if isinstance(payload, dict) else []
 
 def fetch() -> List[Dict[str, str]]:
@@ -216,7 +216,7 @@ def fetch() -> List[Dict[str, str]]:
     if recent_pub_items:
         return recent_pub_items[:20]
 
-    # Last-resort fallback (very rare)
+    # Last-resort fallback: return a few normalized items from page 1 so Slack isn't empty
     if DEBUG:
         print("[worldbank] no future or recent-published items found; returning first page raw-normalized.")
     try:
