@@ -1,11 +1,13 @@
 # connectors/worldbank.py
-# World Bank "Procurement Notices" (official API) — robust future-deadline filter with safe fallback.
+# World Bank "Procurement Notices" — uses observed keys from logs:
+#   deadline -> submission_date
+#   pub date -> noticedate
+#   country  -> project_ctry_name
+#   title    -> project_name (fallback bid_description)
+#   desc     -> bid_description (fallback notice_text)
 #
-# Primary: return notices with deadline >= today (auto-detects deadline field names).
-# Fallback: if none, return recently *published* items (last 365 days), capped to 20, so Slack isn't empty.
-#
-# Optional env:
-#   WB_DEBUG=1  -> print diagnostics in GitHub Actions logs
+# Primary: return notices with deadline >= today.
+# Fallback: if none, return most recent by noticedate (last 365 days), capped to 20.
 
 from __future__ import annotations
 import os, hashlib
@@ -15,8 +17,8 @@ import requests
 
 API = "https://search.worldbank.org/api/procnotices"
 TIMEOUT = 25
-ROWS = 100          # per page
-PAGES = 10          # widen the window (~1000 items)
+ROWS = 100
+PAGES = 10
 DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
 DATE_FMTS = ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d", "%Y.%m.%d")
@@ -72,63 +74,45 @@ def _sig(item: Dict[str, str]) -> str:
     base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-# ---------------- UPDATED: fetch page without 'fl' so we get all fields ----------------
-def _fetch_page(start: int) -> Dict[str, Any] | List[Any]:
-    # Request a broad slice; do NOT restrict fields so we can see actual keys.
+def _fetch_page(start: int) -> Dict[str, Any]:
     params = {
         "format": "json",
         "rows": ROWS,
         "start": start,
-        # no 'fl' here on purpose
+        # no 'fl' — we want all fields since WB varies schemas
     }
     r = requests.get(API, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def _detect_date_fields(obj: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """
-    Try official names first, then heuristics:
-    Returns {'deadline': <raw>, 'published': <raw>} (strings or None).
-    """
-    # Preferred keys
-    deadline_raw = obj.get("deadline") or obj.get("bid_deadline") or obj.get("closing_date")
-    pub_raw = (obj.get("pub_date") or obj.get("publication_date") or
-               obj.get("published_on") or obj.get("posting_date") or obj.get("post_date") or
-               obj.get("issue_date") or obj.get("advertisement_date") or obj.get("last_update"))
+def _extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    block = payload.get("procnotices") or payload.get("procurements") or {}
+    if isinstance(block, dict):
+        return [r for r in block.values() if isinstance(r, dict)]
+    if isinstance(block, list):
+        return [r for r in block if isinstance(r, dict)]
+    # some responses can be raw lists
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    return []
 
-    # Heuristic scan over keys
-    if not deadline_raw:
-        for k, v in obj.items():
-            kl = k.lower()
-            if ("dead" in kl or "clos" in kl or "submit" in kl) and isinstance(v, str):
-                deadline_raw = v
-                break
-    if not pub_raw:
-        for k, v in obj.items():
-            kl = k.lower()
-            if ("pub" in kl or "post" in kl or "issue" in kl or "advert" in kl or "update" in kl) and isinstance(v, str):
-                pub_raw = v
-                break
-    return {"deadline": deadline_raw, "published": pub_raw}
-
-# ---------------- UPDATED: normalize to adapt to whatever keys exist ----------------
 def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     if DEBUG:
         print("[worldbank] normalize keys:", list(n.keys())[:15])
 
-    title = (
-        (n.get("title") or n.get("notice_title") or n.get("tender_title") or n.get("subject") or "")
-        or str(n.get("project_id") or "")
-    ).strip()
+    # observed fields from your logs
+    title = (n.get("project_name") or n.get("bid_description") or "").strip()
+    desc = (n.get("bid_description") or n.get("notice_text") or "").strip()
+    country = (n.get("project_ctry_name") or "").strip()
+    region0 = (n.get("regionname") or "").strip()
 
-    url = (n.get("url") or n.get("notice_url") or n.get("source_url") or "").strip()
-    desc = (n.get("description") or n.get("notice_description") or n.get("tender_description") or "").strip()
-    country = (n.get("countryname") or n.get("country") or "").strip()
-    region0 = (n.get("regionname") or n.get("region") or "").strip()
+    # deadline & pub dates
+    deadline_iso = _to_iso(n.get("submission_date"))
+    pub_iso = _to_iso(n.get("noticedate"))
 
-    dates = _detect_date_fields(n)
-    deadline = _to_iso(dates["deadline"])
-    pub_iso = _to_iso(dates["published"])
+    # build a clickable URL using the notice id (points to JSON detail; OK for MVP)
+    nid = str(n.get("id") or "").strip()
+    url = f"https://search.worldbank.org/api/procnotices?id={nid}" if nid else ""
 
     text = " ".join([title, desc, country, region0])
     region = _infer_region(text, region0)
@@ -137,26 +121,12 @@ def _normalize(n: Dict[str, Any]) -> Dict[str, str]:
     return {
         "title": title or "World Bank procurement notice",
         "url": url,
-        "deadline": deadline,
+        "deadline": deadline_iso,
         "summary": desc[:500],
         "region": region,
         "themes": themes,
-        "_pub": pub_iso  # for debugging only
+        "_pub": pub_iso
     }
-
-def _extract_rows(payload: Dict[str, Any] | List[Any]) -> List[Dict[str, Any]]:
-    """
-    Normalize payload shapes to a list of dicts.
-    """
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-    for key in ("procnotices", "procurements", "data", "rows"):
-        block = payload.get(key)
-        if isinstance(block, dict):
-            return list(block.values())
-        if isinstance(block, list):
-            return [r for r in block if isinstance(r, dict)]
-    return [payload] if isinstance(payload, dict) else []
 
 def fetch() -> List[Dict[str, str]]:
     today = datetime.utcnow().date()
@@ -179,10 +149,7 @@ def fetch() -> List[Dict[str, str]]:
         rows = _extract_rows(payload)
         total_rows += len(rows)
         if DEBUG:
-            typ = type(payload).__name__
-            print(f"[worldbank] page {i+1}: payload type={typ}, rows={len(rows)}")
-            if rows:
-                print(f"[worldbank] sample keys: {sorted(list(rows[0].keys()))[:12]}")
+            print(f"[worldbank] page {i+1}: rows={len(rows)}")
 
         if not rows:
             break
@@ -194,31 +161,27 @@ def fetch() -> List[Dict[str, str]]:
                 continue
             seen.add(s)
 
-            # Primary: keep if deadline >= today (when parseable)
+            # Primary criterion: deadline >= today (uses submission_date)
             dl = _parse_date(item.get("deadline"))
             if dl and dl.date() >= today:
                 future_items.append(item)
                 continue
 
-            # Fallback bucket: recently *published*
+            # Fallback pool: recently published by noticedate
             pub_dt = _parse_date(item.get("_pub"))
             if pub_dt and pub_dt >= recent_cutoff:
                 recent_pub_items.append(item)
 
     if DEBUG:
-        print(f"[worldbank] scanned ~{total_rows} rows, future_deadlines={len(future_items)}, recent_pub={len(recent_pub_items)}")
+        print(f"[worldbank] scanned ~{total_rows} rows, future={len(future_items)}, recent_pub={len(recent_pub_items)}")
 
-    # Primary requirement
     if future_items:
         return future_items
 
-    # Guaranteed non-empty fallback
     if recent_pub_items:
         return recent_pub_items[:20]
 
-    # Last-resort fallback: return a few normalized items from page 1 so Slack isn't empty
-    if DEBUG:
-        print("[worldbank] no future or recent-published items found; returning first page raw-normalized.")
+    # Last-resort: return first 10 items (normalized) from page 0 so Slack isn't empty
     try:
         payload = _fetch_page(0)
         rows = _extract_rows(payload)[:10]
