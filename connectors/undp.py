@@ -16,7 +16,7 @@ VIEW_URL = BASE + "/view_notice.cfm?notice_id={nid}"
 
 TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.1; +https://example.org)",
+    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.2; +https://example.org)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.7",
     "Cache-Control": "no-cache",
@@ -44,9 +44,18 @@ CUTOFF = TODAY - timedelta(days=PUB_WINDOW_DAYS)
 DATE_FMTS = (
     "%d-%b-%Y", "%d %b %Y", "%Y-%m-%d",
     "%m/%d/%Y", "%Y/%m/%d",
+    "%d-%b-%y", "%d %b %y",        # 2-digit year
+    "%d %B %Y", "%d-%B-%Y",        # full month
 )
 
 TAG_RE = re.compile(r"<[^>]+>")
+NID_ANY_RE = re.compile(r'view_notice\.cfm\?notice_id=(\d+)', re.I)
+
+TITLE_RE    = re.compile(r'(?is)<h\d[^>]*>\s*(.+?)\s*</h\d>')
+COUNTRY_RE  = re.compile(r'(?i)^\s*(country|country of assignment)\s*:\s*(.+?)\s*$', re.M)
+POSTED_RE   = re.compile(r'(?i)^\s*(posted on|publication date|posted)\s*:\s*(.+?)\s*$', re.M)
+DEADLINE_RE = re.compile(r'(?i)^\s*(deadline|closing date|closing)\s*:\s*(.+?)\s*$', re.M)
+TYPE_RE     = re.compile(r'(?i)^\s*(procurement method|notice type|process|category)\s*:\s*(.+?)\s*$', re.M)
 
 def _strip_html(text: str) -> str:
     if not text: return ""
@@ -57,14 +66,28 @@ def _sentence_case(s: str) -> str:
     if not s: return s
     return s[0].upper() + s[1:]
 
+def _clean_date_string(s: str) -> str:
+    """Remove timezones, times, and fluff like '@ 05:00 PM (GMT+0)'."""
+    s = s.strip()
+    # Keep only the first date-like token; strip trailing time/zone
+    m = re.search(r'(\d{1,2}[ \-/](?:[A-Za-z]{3,}|[0-9]{1,2})[ \-/]\d{2,4}|\d{4}-\d{2}-\d{2})', s)
+    if m:
+        s = m.group(1)
+    s = s.replace(",", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
     if not s: return None
-    s = s.strip()
-    s = re.sub(r"(?i)\b(posted on|publication date|posted)\s*:\s*", "", s)
-    s = re.sub(r"(?i)\b(deadline|closing date|closing)\s*:\s*", "", s)
+    s = re.sub(r"(?i)\b(posted on|publication date|posted|deadline|closing date|closing)\s*:\s*", "", s.strip())
+    s = _clean_date_string(s)
     for fmt in DATE_FMTS:
         try:
-            return datetime.strptime(s, fmt)
+            dt = datetime.strptime(s, fmt)
+            # Normalize 2-digit year into 2000s if needed
+            if dt.year < 100:
+                dt = dt.replace(year=2000 + dt.year)
+            return dt
         except Exception:
             continue
     return None
@@ -84,7 +107,7 @@ def _get(url: str, params: Dict[str, Any] | None = None) -> str:
     r.raise_for_status()
     return r.text
 
-# ----- Topic taxonomy (same as WB connector) -----
+# ----- Topic taxonomy -----
 TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "Access to Information": [
         "access to information","right to information","freedom of information","foi",
@@ -136,10 +159,6 @@ def _detect_topics(text: str) -> List[str]:
         if x not in out: out.append(x)
     return out
 
-# -------- Robust list parsing --------
-# Find ANY mention of view_notice.cfm?notice_id=NNNNN (abs/rel URL, single/double quotes, data-* attributes, JS)
-NID_ANY_RE = re.compile(r'view_notice\.cfm\?notice_id=(\d+)', re.I)
-
 def _parse_list(html: str) -> List[str]:
     nids = NID_ANY_RE.findall(html)
     out, seen = [], set()
@@ -148,13 +167,6 @@ def _parse_list(html: str) -> List[str]:
             out.append(nid)
             seen.add(nid)
     return out
-
-# -------- Detail parsing --------
-TITLE_RE    = re.compile(r'(?is)<h\d[^>]*>\s*(.+?)\s*</h\d>')
-COUNTRY_RE  = re.compile(r'(?i)^\s*(country|country of assignment)\s*:\s*(.+?)\s*$', re.M)
-POSTED_RE   = re.compile(r'(?i)^\s*(posted on|publication date|posted)\s*:\s*(.+?)\s*$', re.M)
-DEADLINE_RE = re.compile(r'(?i)^\s*(deadline|closing date|closing)\s*:\s*(.+?)\s*$', re.M)
-TYPE_RE     = re.compile(r'(?i)^\s*(procurement method|notice type|process|category)\s*:\s*(.+?)\s*$', re.M)
 
 def _parse_detail(html: str) -> Dict[str, str]:
     text = _strip_html(html)
@@ -168,10 +180,10 @@ def _parse_detail(html: str) -> Dict[str, str]:
     deadline = _line(DEADLINE_RE)
     ntype    = _line(TYPE_RE)
     if not posted:
-        m = re.search(r'(?i)posted\s*on\s*[:\-]\s*([A-Za-z0-9, \-\/]+)', text)
+        m = re.search(r'(?i)posted\s*on\s*[:\-]\s*([A-Za-z0-9, @:\-\(\)\/]+)', text)
         if m: posted = m.group(1).strip()
     if not deadline:
-        m = re.search(r'(?i)(deadline|closing date)\s*[:\-]\s*([A-Za-z0-9, \-\/]+)', text)
+        m = re.search(r'(?i)(deadline|closing date)\s*[:\-]\s*([A-Za-z0-9, @:\-\(\)\/]+)', text)
         if m: deadline = m.group(2).strip()
     return {
         "title": title,
@@ -182,7 +194,6 @@ def _parse_detail(html: str) -> Dict[str, str]:
         "summary": text[:1200],
     }
 
-# -------- Filters --------
 def _in_window(pub_iso: str | None) -> bool:
     dt = _parse_date(pub_iso)
     return bool(dt and CUTOFF <= dt.date() <= TODAY)
@@ -206,10 +217,14 @@ def _matches_topics(item: Dict[str, str]) -> bool:
     topics = [t.strip() for t in (item.get("themes","") or "").split(",") if t.strip()]
     return any(t in allowed for t in topics)
 
-# -------- Main --------
 def fetch() -> List[Dict[str, str]]:
     seen_urls, seen_sigs = set(), set()
     results: List[Dict[str, str]] = []
+
+    # Debug counters
+    total_ids = 0
+    detail_ok = 0
+    dropped_old = dropped_no_pub = dropped_topics = dropped_qterm = 0
 
     for page in range(1, PAGES + 1):
         nids: List[str] = []
@@ -228,7 +243,7 @@ def fetch() -> List[Dict[str, str]]:
                 break
         if DEBUG:
             print(f"[undp] page {page}: variant={used_variant or '(none)'} found {len(nids)} notice ids")
-
+        total_ids += len(nids)
         if not nids:
             continue
 
@@ -248,8 +263,14 @@ def fetch() -> List[Dict[str, str]]:
             country = info.get("country","").strip()
             base_title = info.get("title","").strip()
             ntype = info.get("type","").strip()
-            posted_iso = _to_iso(info.get("posted",""))
-            deadline_iso = _to_iso(info.get("deadline",""))
+
+            posted_iso_raw = info.get("posted","") or ""
+            deadline_iso_raw = info.get("deadline","") or ""
+            posted_iso = _to_iso(posted_iso_raw)
+            deadline_iso = _to_iso(deadline_iso_raw)
+
+            # Fallback: if no Posted date, use Deadline as publication reference
+            pub_ref_iso = posted_iso or deadline_iso
 
             if base_title:
                 final_title = _sentence_case(base_title)
@@ -272,17 +293,21 @@ def fetch() -> List[Dict[str, str]]:
                 "summary": summary,
                 "region": "",
                 "themes": themes,
-                "_pub": posted_iso,
+                "_pub": pub_ref_iso,     # <- use posted if present; else deadline
                 "_type": ntype,
                 "_country": country,
                 "_nid": nid,
             }
 
+            # Filters + counters
             if not _in_window(item.get("_pub")):
+                dropped_old += 1
                 continue
-            if not _matches_qterm(item):
+            if UNDP_QTERM and not _matches_qterm(item):
+                dropped_qterm += 1
                 continue
-            if not _matches_topics(item):
+            if UNDP_REQUIRE_TOPIC_MATCH and not _matches_topics(item):
+                dropped_topics += 1
                 continue
 
             sig = _sig(item)
@@ -291,12 +316,15 @@ def fetch() -> List[Dict[str, str]]:
             seen_sigs.add(sig)
 
             results.append(item)
+            detail_ok += 1
             if len(results) >= MAX_RESULTS:
-                if DEBUG: print(f"[undp] reached MAX_RESULTS={MAX_RESULTS}")
+                if DEBUG:
+                    print(f"[undp] reached MAX_RESULTS={MAX_RESULTS} (ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_qterm={dropped_qterm}, no_topic={dropped_topics})")
                 return results
 
     if DEBUG:
-        print(f"[undp] emitted={len(results)} (window={PUB_WINDOW_DAYS}d, pages={PAGES})")
+        print(f"[undp] emitted={len(results)} (window={PUB_WINDOW_DAYS}d, pages={PAGES}) "
+              f"[ids={total_ids}, kept={detail_ok}, old={dropped_old}, no_qterm={dropped_qterm}, no_topic={dropped_topics}]")
 
     if not results:
         return [{
