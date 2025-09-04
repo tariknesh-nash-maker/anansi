@@ -1,34 +1,56 @@
 # connectors/worldbank.py
-# Real World Bank procurement connector using the public Search API.
-# Docs (reference): World Bank Search API v2 (procurements endpoint).
-# Output shape: list of dicts with keys: title, url, deadline, summary, region, themes
+# World Bank connector via Socrata API (generic).
+# Reads env: WB_SOCRATA_DOMAIN, WB_DATASET_ID, WB_APP_TOKEN (optional)
+#
+# Output: list[dict] with keys: title, url, deadline, summary, region, themes
 
-import hashlib
-import json
-import time
+from __future__ import annotations
+import os, time, hashlib
+from typing import List, Dict
 from datetime import datetime
-from typing import Dict, List
 import requests
 
-# --------- Config ---------
-WB_API = "https://search.worldbank.org/api/v2/procurements"
-# Governance-relevant keyword buckets (feel free to edit)
-QUERY_TERMS = [
-    "beneficial ownership OR transparency OR anti-corruption",
-    "budget OR public finance OR fiscal transparency",
-    "digital governance OR data protection OR cybersecurity OR AI",
-    "open parliament OR legislative transparency",
-    "climate finance OR MRV OR adaptation OR resilience"
+SOCRATA_DOMAIN = os.getenv("WB_SOCRATA_DOMAIN", "finances.worldbank.org")  # e.g., finances.worldbank.org
+DATASET_ID     = os.getenv("WB_DATASET_ID", "")  # e.g., 'abcd-1234'  <-- fill this
+APP_TOKEN      = os.getenv("WB_APP_TOKEN", "")   # optional but helps with rate limits
+
+# ---- Tuning (edit as you like) ----
+# Simple governance-relevant keyword buckets
+KEYWORDS = [
+    "beneficial ownership", "transparency", "anti-corruption", "integrity",
+    "budget", "public finance", "fiscal transparency",
+    "digital governance", "data protection", "cybersecurity", "AI",
+    "open parliament", "legislative transparency",
+    "climate finance", "MRV", "adaptation", "resilience"
 ]
-# Regions/countries to bias (simple post-filter)
-REGION_KEYWORDS = [
-    "Africa", "Middle East", "North Africa", "MENA",
-    # country names (add as needed)
-    "Morocco", "Benin", "Cote d'Ivoire", "Côte d’Ivoire", "Senegal",
-    "Ghana", "Liberia", "Tunisia", "Jordan", "Burkina Faso"
+# Region filter: keep broad, we’ll match in text and also country/region fields if present
+REGION_HINTS = [
+    "africa", "west africa", "east africa", "southern africa", "north africa",
+    "mena", "middle east", "maghreb", "sahel",
+    # add country names to strengthen match:
+    "morocco", "tunisia", "algeria", "egypt", "jordan",
+    "benin", "cote d'ivoire", "côte d’ivoire", "senegal", "ghana", "liberia",
+    "burkina faso", "niger", "mali", "togo", "mauritania", "sierra leone"
 ]
 
-# --------- Helpers ---------
+# Map dataset field names -> normalized fields (adjust after you inspect the dataset)
+# TIP: after you identify the dataset, print one row and update these fields to fit.
+FIELD_MAP = {
+    # try common field guesses; you will refine after you see the dataset schema
+    "title":         ["title", "notice_title", "tender_title", "project_name", "subject"],
+    "description":   ["description", "notice_description", "summary", "tender_description"],
+    "deadline":      ["bid_deadline", "deadline", "submission_deadline", "closing_date"],
+    "url":           ["url", "source_url", "notice_url", "link"],
+    "country":       ["country", "country_name"],
+    "region":        ["region", "region_name"]
+}
+
+def _pick(record: Dict, keys: list[str]) -> str:
+    for k in keys:
+        if k in record and record[k]:
+            return str(record[k])
+    return ""
+
 def _themes_from_text(text: str) -> List[str]:
     t = text.lower()
     themes = []
@@ -42,128 +64,105 @@ def _themes_from_text(text: str) -> List[str]:
         themes.append("open_parliament")
     if any(k in t for k in ["climate", "adaptation", "resilience", "mrv", "just transition"]):
         themes.append("climate")
-    return list(dict.fromkeys(themes))[:3]  # unique, max 3
+    return list(dict.fromkeys(themes))[:3]
 
-def _region_from_text(text: str) -> str:
-    for k in REGION_KEYWORDS:
-        if k.lower() in text.lower():
-            # coarse label
-            if k in ["Africa"] or k in ["Morocco","Benin","Cote d'Ivoire","Côte d’Ivoire","Senegal","Ghana","Liberia","Burkina Faso"]:
-                return "Africa"
-            if k in ["Middle East","North Africa","MENA","Tunisia","Jordan"]:
-                return "MENA"
-    return ""  # unknown
+def _infer_region(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["mena", "middle east", "north africa", "maghreb"]):
+        return "MENA"
+    if "africa" in t or any(k in t for k in [
+        "west africa","east africa","southern africa","sahel",
+        "morocco","tunisia","algeria","egypt","jordan",
+        "benin","cote d'ivoire","côte d’ivoire","senegal","ghana","liberia","burkina faso",
+        "niger","mali","togo","mauritania","sierra leone"
+    ]):
+        return "Africa"
+    return ""
 
-def _normalize_notice(n: Dict) -> Dict:
-    """
-    WB API returns notices under dict keyed by an ID:
-    {
-      "notice_no": "...",
-      "title": "...",
-      "url": "...",
-      "procurement_method": "...",
-      "pub_date": "2025-08-28",
-      "deadline": "2025-09-30",
-      "description": "...",
-      "countryname": "Morocco",
-      ...
-    }
-    """
-    title = (n.get("title") or "").strip()
-    url = (n.get("url") or "").strip()
-    deadline = (n.get("deadline") or "").strip()
-    desc = (n.get("description") or "").strip()
-    country = (n.get("countryname") or "").strip()
-    combo = " ".join([title, desc, country])
-    themes = ",".join(_themes_from_text(combo))
-    region = _region_from_text(" ".join([country, n.get("regionname","") or "", desc]))
-
-    # Normalize date to YYYY-MM-DD if possible
-    if deadline:
+def _to_iso_date(val: str) -> str:
+    if not val:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d"):
         try:
-            # WB may return like '2025-09-30' or '30-Sep-2025' depending on notice
-            dt = None
-            for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%m/%d/%Y"):
-                try:
-                    dt = datetime.strptime(deadline, fmt)
-                    break
-                except Exception:
-                    pass
-            if dt:
-                deadline = dt.date().isoformat()
-            else:
-                # leave as given if unknown format
-                pass
+            return datetime.strptime(val.strip(), fmt).date().isoformat()
         except Exception:
             pass
+    # leave as-is if we can’t parse
+    return val.strip()
+
+def _normalize(record: Dict) -> Dict:
+    title   = _pick(record, FIELD_MAP["title"]).strip()
+    desc    = _pick(record, FIELD_MAP["description"]).strip()
+    deadline= _to_iso_date(_pick(record, FIELD_MAP["deadline"]))
+    url     = _pick(record, FIELD_MAP["url"]).strip()
+    country = _pick(record, FIELD_MAP["country"]).strip()
+    region0 = _pick(record, FIELD_MAP["region"]).strip()
+
+    text = " ".join([title, desc, country, region0])
+    themes = ",".join(_themes_from_text(text))
+    region = _infer_region(text) or region0
 
     return {
-        "title": title or "World Bank procurement notice",
+        "title": title or "World Bank opportunity",
         "url": url,
         "deadline": deadline,
         "summary": desc[:500],
-        "region": region or ( "Africa" if (country and country in REGION_KEYWORDS) else "" ),
-        "themes": themes or ""
+        "region": region,
+        "themes": themes
     }
 
-def _fetch_page(qterm: str, rows: int = 50, start: int = 0) -> Dict:
-    # qterm: search string
-    # rows: number of results
-    # start: pagination offset
-    params = {
-        "format": "json",
-        "qterm": qterm,
-        "rows": rows,
-        "fl": "title,url,deadline,description,countryname,regionname,pub_date"  # fields list
-    }
-    if start:
-        params["start"] = start
-    r = requests.get(WB_API, params=params, timeout=30)
+def _socrata_get(domain: str, dataset: str, where: str = "", limit: int = 2000, offset: int = 0, select: str = "") -> list[Dict]:
+    url = f"https://{domain}/resource/{dataset}.json"
+    headers = {}
+    if APP_TOKEN:
+        headers["X-App-Token"] = APP_TOKEN
+    params = {"$limit": limit, "$offset": offset}
+    if where:
+        params["$where"] = where
+    if select:
+        params["$select"] = select
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    if r.status_code == 429:
+        # rate-limited; back off and retry once
+        time.sleep(2.0)
+        r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def _iter_query(qterm: str, max_results: int = 120) -> List[Dict]:
-    items = []
-    start = 0
-    while len(items) < max_results:
-        data = _fetch_page(qterm, rows=50, start=start)
-        # API returns {"status":"OK","total":N,"procurements":{id:{...}, id2:{...}}}
-        procs = data.get("procurements") or {}
-        if not procs:
-            break
-        batch = list(procs.values())
-        items.extend(batch)
-        start += len(batch)
-        # stop if we've read all
-        total = data.get("total") or len(items)
-        if start >= total:
-            break
-        time.sleep(0.5)  # be polite
-    return items
-
 def fetch() -> List[Dict]:
-    # Aggregate across qterms; dedupe by URL/title
-    seen = set()
+    """
+    Pulls rows from the given Socrata dataset and returns normalized items.
+    Start wide: no server-side filtering; do client filtering/normalization first.
+    """
+    if not DATASET_ID:
+        # Not configured yet; return empty so the pipeline doesn't crash.
+        print("[worldbank] WB_DATASET_ID not set; returning empty list.")
+        return []
+
     out: List[Dict] = []
-    for q in QUERY_TERMS:
-        try:
-            raw_items = _iter_query(q)
-        except Exception as e:
-            print(f"[worldbank] query failed: {q} -> {e}")
-            continue
-        for n in raw_items:
-            norm = _normalize_notice(n)
-            sig = hashlib.sha1(f"{norm.get('title','')}|{norm.get('url','')}".encode("utf-8")).hexdigest()
-            if sig in seen:
-                continue
-            # Simple region filter for MVP: keep Africa/MENA/target countries if present;
-            # if region unknown, still include (the aggregator will post; you can refine later).
-            text_for_region = " ".join([norm.get("summary",""), n.get("countryname","") or ""])
-            if any(k.lower() in text_for_region.lower() for k in [c.lower() for c in REGION_KEYWORDS]) or norm.get("region"):
-                out.append(norm)
-                seen.add(sig)
-            else:
-                # Keep some global calls (optional). Comment out next two lines to only keep regional.
-                out.append(norm)
-                seen.add(sig)
+    offset = 0
+    page   = 500  # Socrata default limits; adjust if needed
+    seen   = set()
+
+    # Optional server-side WHERE example (uncomment after you know field names):
+    # where = "upper(region) like '%AFRICA%' OR upper(region) like '%MIDDLE EAST%'"
+    where = ""  # start with no filter; refine later when you know schema
+
+    while True:
+        rows = _socrata_get(SOCRATA_DOMAIN, DATASET_ID, where=where, limit=page, offset=offset)
+        if not rows:
+            break
+        for rec in rows:
+            norm = _normalize(rec)
+            # Basic keyword/region post-filter for Africa/MENA relevance
+            text = " ".join([norm["title"], norm["summary"], norm["region"]]).lower()
+            if any(k in text for k in REGION_HINTS) or any(k in text for k in KEYWORDS):
+                sig = hashlib.sha1(f"{norm['title']}|{norm['url']}|{norm['deadline']}".encode("utf-8")).hexdigest()
+                if sig not in seen:
+                    out.append(norm)
+                    seen.add(sig)
+        offset += len(rows)
+        if len(rows) < page:
+            break
+
     return out
