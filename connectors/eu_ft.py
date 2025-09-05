@@ -1,15 +1,35 @@
-# connectors/eu_ft.py
+# -*- coding: utf-8 -*-
+"""
+EU Funding & Tenders (F&T) — EC Search API (SEDIA)
+Robust GET-with-params implementation + fallback (no facets) if the API returns 400.
+
+Docs/refs:
+- F&T “Support / APIs” page (mentions Search API & Facet API; base URL). 
+- Community examples show using GET with ?apiKey=SEDIA&text=…&pageSize=…&pageNumber=….
+
+This module exposes:
+  - fetch(max_items=..., since_days=..., ogp_only=True) -> List[dict]
+  - Connector().fetch(...)
+"""
 from __future__ import annotations
-import hashlib, json, logging, os, re, requests
+
+import hashlib
+import logging
+import os
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+import requests
 from dateutil import parser as dateparser
 
 LOG = logging.getLogger(__name__)
 
 API_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-API_KEY = os.getenv("EU_FT_API_KEY", "SEDIA")  # public key typically 'SEDIA'
+API_KEY = os.getenv("EU_FT_API_KEY", "SEDIA")  # public key commonly 'SEDIA'
+
+# Observed status facet codes on the portal:
 STATUS_OPEN = "31094502"
 STATUS_FORTHCOMING = "31094501"
 
@@ -33,13 +53,14 @@ class Opportunity:
     country_scope: Optional[str]
     amount: Optional[str] = None
     currency: Optional[str] = None
-    def to_dict(self) -> Dict: return asdict(self)
+    def to_dict(self) -> Dict: 
+        return asdict(self)
 
 def _hash_id(*parts: str) -> str:
-    return "euft_" + hashlib.sha1("::".join([p for p in parts if p]).encode()).hexdigest()[:16]
+    return "euft_" + hashlib.sha1("::".join([p for p in parts if p]).encode("utf-8")).hexdigest()[:16]
 
 def _classify(text: str) -> List[str]:
-    t = text.lower()
+    t = (text or "").lower()
     tags = set()
     if any(k in t for k in ["digital","data","ai","e-government","open data","ict"]): tags.add("ai_digital")
     if any(k in t for k in ["budget","public finance","pfm"]): tags.add("budget")
@@ -50,11 +71,13 @@ def _classify(text: str) -> List[str]:
     return sorted(tags)
 
 def _pick_deadline(meta: Dict, text_fields: List[str]) -> Optional[str]:
+    # Try metadata keys first
     for k in ["deadlineDate","submissionDeadlineDate","tenderDeadlineDate","endDate","deadline","closingDate"]:
-        v = meta.get(k)
+        v = (meta or {}).get(k)
         if v:
             try: return dateparser.parse(v).date().isoformat()
             except Exception: pass
+    # Fallback: regex in free text
     rx = re.compile(r"(?:Deadline|Closing)\s*[:\-]?\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
     for t in text_fields:
         if not t: continue
@@ -64,47 +87,80 @@ def _pick_deadline(meta: Dict, text_fields: List[str]) -> Optional[str]:
             except Exception: pass
     return None
 
+def _request(params: Dict) -> Dict:
+    """Perform GET; if 400 and we used facets, retry without them."""
+    r = requests.get(API_URL, params=params, timeout=30)
+    if r.status_code == 400 and ("type" in params or "status" in params):
+        LOG.warning("EU F&T: 400 with facets — retrying without 'type'/'status'")
+        params = {k: v for k, v in params.items() if k not in ("type", "status")}
+        r = requests.get(API_URL, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
 def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool = True) -> List[Dict]:
     out: List[Opportunity] = []
-    page, page_size = 1, min(50, max_items)
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat() if since_days else None
 
+    page = 1
+    page_size = min(50, max_items)
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat() if since_days else None
+
+    # Build base params — use GET with query string
+    text_query = " OR ".join(OGP_KEYWORDS) if ogp_only else "*"
+    base_params = {
+        "apiKey": API_KEY,
+        "text": text_query,
+        "pageSize": str(page_size),
+        "sort": "sortStatus",  # same sort as portal
+    }
+    # Attempt facet narrowing (type & status). If server rejects (400),
+    # _request() will retry without them.
+    facet_params = []
+    for t in ("1","2"):
+        facet_params.append(("type", t))
+    for s in (STATUS_OPEN, STATUS_FORTHCOMING):
+        facet_params.append(("status", s))
+
+    # Pagination loop
     while len(out) < max_items:
-        payload = {
-            "apiKey": API_KEY,
-            "query": {
-                "bool": {
-                    "must": [
-                        {"terms": {"type": ["1","2"]}},           # Calls/Topics
-                        {"terms": {"status": [STATUS_OPEN, STATUS_FORTHCOMING]}},
-                    ] + ([{"range": {"publicationDate": {"gte": cutoff}}}] if cutoff else [])
-                }
-            },
-            "languages": ["en"],
-            "pageNumber": page,
-            "pageSize": page_size,
-            "sort": {"field": "sortStatus", "order": "ASC"}
-        }
-        r = requests.post(API_URL, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+        params = list(base_params.items()) + facet_params + [("pageNumber", str(page))]
+        if cutoff_date:
+            # Some deployments honor a publicationDate lower bound
+            params.append(("publicationDateFrom", cutoff_date))
+        data = _request(dict(params))
+
         results = data.get("results") or []
-        if not results: break
+        if not results:
+            break
 
         for r in results:
             title = r.get("content") or r.get("title") or ""
             url = r.get("url") or r.get("uri") or ""
             md = r.get("metadata") or {}
+
+            # Published date
             published = md.get("publicationDate") or md.get("startDate")
             if published:
                 try: published = dateparser.parse(published).date().isoformat()
                 except Exception: published = None
-            text = " ".join(filter(None, [title, md.get("teaser"), md.get("summary"), " ".join(md.get("keywords", []) or [])]))
-            if ogp_only and not any(k in text.lower() for k in [k.lower() for k in OGP_KEYWORDS]):
+
+            # Optional client-side keyword check (in case facets vanished on fallback)
+            fulltext = " ".join(filter(None, [
+                title, md.get("teaser"), md.get("summary"), " ".join(md.get("keywords", []) or [])
+            ]))
+            if ogp_only and not any(k in (fulltext or "").lower() for k in [k.lower() for k in OGP_KEYWORDS]):
                 continue
-            deadline = _pick_deadline(md, [text])
-            status = "open" if deadline and dateparser.parse(deadline).date() >= datetime.utcnow().date() else "forthcoming" if md.get("status")==STATUS_FORTHCOMING else None
-            out.append(Opportunity(
+
+            deadline = _pick_deadline(md, [fulltext])
+            status = None
+            try:
+                if deadline and dateparser.parse(deadline).date() >= datetime.utcnow().date():
+                    status = "open"
+            except Exception:
+                pass
+            if not status and md.get("status") == STATUS_FORTHCOMING:
+                status = "forthcoming"
+
+            opp = Opportunity(
                 id=_hash_id(title, url),
                 title=title.strip(),
                 donor="EU F&T",
@@ -112,16 +168,21 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
                 deadline=deadline,
                 published_date=published,
                 status=status,
-                tags=_classify(text),
-                country_scope=md.get("geographicalZonesText") or md.get("geographicalZones") or None
-            ))
-            if len(out) >= max_items: break
+                tags=_classify(fulltext),
+                country_scope=md.get("geographicalZonesText") or md.get("geographicalZones") or None,
+            )
+            out.append(opp)
+            if len(out) >= max_items:
+                break
 
-        if len(results) < page_size: break
+        if len(results) < page_size:
+            break
         page += 1
 
     return [o.to_dict() for o in out]
+
 class Connector:
     name = "eu_ft"
     def __init__(self, **kwargs): self.kwargs = kwargs
-    def fetch(self, **kwargs) -> List[Dict]: return fetch(**{**self.kwargs, **kwargs})
+    def fetch(self, **kwargs) -> List[Dict]:
+        return fetch(**{**self.kwargs, **kwargs})
