@@ -1,6 +1,10 @@
+[anansi]
+connectors = ["worldbank", "undp", "eu_ft", "afdb", "afd"]
+
 # copy to settings.toml
 regions = ["africa", "mena"]         # used to filter text
 themes  = ["ai_digital","budget","anti_corruption","climate","open_parliament","cso_support"]
+channel = "news_westnorthafrica"
 
 [slack]
 webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
