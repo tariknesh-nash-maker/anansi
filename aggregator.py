@@ -2,7 +2,7 @@ import os, json, hashlib, textwrap
 from datetime import datetime
 from pathlib import Path
 
-from connectors.eu import fetch as fetch_eu
+from connectors.eu_ft import fetch as fetch_eu
 from connectors.undp import fetch as fetch_undp
 from connectors.afdb import fetch as fetch_afdb
 from connectors.worldbank import fetch as fetch_wb
