@@ -16,7 +16,7 @@ VIEW_URL = BASE + "/view_notice.cfm?notice_id={nid}"
 
 TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.5; +https://example.org)",
+    "User-Agent": "Mozilla/5.0 (compatible; anansi-undp/1.6; +https://example.org)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.7",
     "Cache-Control": "no-cache",
@@ -34,7 +34,7 @@ UNDP_TOPIC_LIST = os.getenv("UNDP_TOPIC_LIST",
 ).strip()
 UNDP_REQUIRE_TOPIC_MATCH = os.getenv("UNDP_REQUIRE_TOPIC_MATCH", "1") == "1"
 
-# Optional free-text keyword filter (pipe-separated)
+# Optional keyword filter (pipe-separated, e.g., "rfp|eoi|open data")
 UNDP_QTERM = os.getenv("UNDP_QTERM", "").strip().lower()
 
 TODAY: date  = datetime.utcnow().date()
@@ -75,13 +75,11 @@ DATE_TOKEN_RE = re.compile(
 )
 
 def _strip_html(text: str) -> str:
-    if not text: return ""
-    return TAG_RE.sub("", unescape(text)).strip()
+    return TAG_RE.sub("", unescape(text or "")).strip()
 
 def _sentence_case(s: str) -> str:
     s = s.strip()
-    if not s: return s
-    return s[0].upper() + s[1:]
+    return s[0].upper() + s[1:] if s else s
 
 def _clean_date_string(s: str) -> str:
     s = unescape(s or "").replace("&nbsp;", " ")
@@ -92,8 +90,7 @@ def _clean_date_string(s: str) -> str:
             if g:
                 s = g
                 break
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
     if not s: return None
@@ -102,11 +99,9 @@ def _parse_date(s: Optional[str]) -> Optional[datetime]:
     for fmt in DATE_FMTS:
         try:
             dt = datetime.strptime(s, fmt)
-            if dt.year < 100:
-                dt = dt.replace(year=2000 + dt.year)
+            if dt.year < 100: dt = dt.replace(year=2000+dt.year)
             return dt
-        except Exception:
-            continue
+        except Exception: continue
     return None
 
 def _to_iso(s: Optional[str]) -> str:
@@ -114,9 +109,7 @@ def _to_iso(s: Optional[str]) -> str:
     return dt.date().isoformat() if dt else ""
 
 def _sig(item: Dict[str, str]) -> str:
-    key = item.get("url") or "|".join([
-        item.get("title",""), item.get("_type",""), item.get("_pub","")
-    ])
+    key = item.get("url") or "|".join([item.get("title",""), item.get("_type",""), item.get("_pub","")])
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 def _get(url: str, params: Dict[str, Any] | None = None) -> str:
@@ -176,33 +169,26 @@ def _detect_topics(text: str) -> List[str]:
         if x not in out: out.append(x)
     return out
 
-# --- Parsing helpers ---
+# --- List + meta/labels parsing ---
+def _parse_list(html: str) -> List[str]:
+    """Extract notice IDs from a listing page."""
+    nids = NID_ANY_RE.findall(html)
+    return list(dict.fromkeys(nids))  # dedupe, preserve order
+
 def _meta_map(html: str) -> Dict[str,str]:
-    metas = {}
-    for name, content in META_RE.findall(html):
-        metas[name.strip().lower()] = unescape(content).strip()
-    return metas
+    return {name.strip().lower(): unescape(content).strip()
+            for name, content in META_RE.findall(html)}
 
 def _extract_label_near(html: str, text: str, key: str) -> str:
-    # try text-line first
-    if key == "posted":
-        m = POSTED_RE.search(text)
-    elif key == "deadline":
-        m = DEADLINE_RE.search(text)
-    elif key == "country":
-        m = COUNTRY_RE.search(text)
-    elif key == "type":
-        m = TYPE_RE.search(text)
-    else:
-        m = None
-    if m:
-        return m.group(2).strip()
-    # then HTML-near
+    rex = {"posted": POSTED_RE, "deadline": DEADLINE_RE,
+           "country": COUNTRY_RE, "type": TYPE_RE}.get(key)
+    if rex:
+        m = rex.search(text)
+        if m: return m.group(2).strip()
     rx = NEAR.get(key)
     if rx:
         m = rx.search(html)
-        if m:
-            return m.group(2).strip()
+        if m: return m.group(2).strip()
     return ""
 
 def _parse_detail(html: str) -> Dict[str, str]:
@@ -213,45 +199,35 @@ def _parse_detail(html: str) -> Dict[str, str]:
     title_meta = metas.get("og:title") or metas.get("twitter:title") or ""
     desc_meta  = metas.get("og:description") or metas.get("description") or ""
 
-    # Fallback heading if meta missing
     if not title_meta:
         m = re.search(r'(?is)<h1[^>]*>(.+?)</h1>', html) or re.search(r'(?is)<h2[^>]*>(.+?)</h2>', html)
         title_meta = _sentence_case(_strip_html(m.group(1))) if m else ""
 
-    # Label-based fields
     country  = _extract_label_near(html, text, "country")
     posted   = _extract_label_near(html, text, "posted")
     deadline = _extract_label_near(html, text, "deadline")
     ntype    = _extract_label_near(html, text, "type")
 
-    # Last-resort: scan whole page for date tokens
+    # Last resort tokens
     if not posted or not _parse_date(posted):
-        m = DATE_TOKEN_RE.findall(html)
-        tokens = [g for tup in m for g in tup if g]
-        if tokens:
-            posted = _clean_date_string(tokens[0])  # earliest token ≈ posted
-
+        tokens = [g for tup in DATE_TOKEN_RE.findall(html) for g in tup if g]
+        if tokens: posted = _clean_date_string(tokens[0])
     if not deadline or not _parse_date(deadline):
-        m = DATE_TOKEN_RE.findall(html)
-        tokens = [g for tup in m for g in tup if g]
-        if tokens:
-            deadline = _clean_date_string(tokens[-1])  # latest token ≈ deadline
-
-    # Compose fields
-    title = title_meta.strip()
-    summary = (desc_meta or text[:1000]).strip()
+        tokens = [g for tup in DATE_TOKEN_RE.findall(html) for g in tup if g]
+        if tokens: deadline = _clean_date_string(tokens[-1])
 
     return {
-        "title": title,
+        "title": (title_meta or "").strip(),
         "country": country,
         "posted": posted,
         "deadline": deadline,
         "type": ntype,
-        "summary": summary,
+        "summary": (desc_meta or text[:1000]).strip(),
     }
 
 # --- Filters ---
 def _in_window_or_future_deadline(pub_iso: str | None, deadline_iso: str | None) -> bool:
+    """Keep if (posted within window) OR (no posted but deadline is today/future)."""
     pub_dt = _parse_date(pub_iso) if pub_iso else None
     if pub_dt:
         return CUTOFF <= pub_dt.date() <= TODAY
@@ -261,10 +237,9 @@ def _in_window_or_future_deadline(pub_iso: str | None, deadline_iso: str | None)
 def _matches_qterm(item: Dict[str, str]) -> bool:
     pat = UNDP_QTERM
     if not pat: return True
-    norm = (pat
-        .replace('"', ' ').replace("(", " ").replace(")", " ")
-        .replace(" or ", "|").replace(" OR ", "|").replace(" Or ", "|")
-        .replace(",", "|"))
+    norm = (pat.replace('"',' ').replace("(", " ").replace(")", " ")
+               .replace(" or ", "|").replace(" OR ", "|").replace(" Or ", "|")
+               .replace(",", "|"))
     tokens = [t.strip() for t in norm.split("|") if t.strip()]
     if not tokens: return True
     hay = " ".join([item.get("title",""), item.get("summary",""), item.get("_type","")]).lower()
