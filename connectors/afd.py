@@ -1,194 +1,106 @@
-# -*- coding: utf-8 -*-
-"""
-AFD (Agence Française de Développement) — Calls for projects.
-
-Primary listing:
-  https://www.afd.fr/en/calls-for-projects/list?status[ongoing]=ongoing&status[soon]=soon
-
-We parse the card grid to capture Title, URL, opening/closing dates, geography
-and apply a lightweight OGP keyword classifier.
-
-Exposed:
-  - fetch(max_items=..., since_days=..., ogp_only=True)
-  - Connector().fetch(...)
-
-Test:
-    python -m connectors.afd
-"""
+# connectors/afd.py
 from __future__ import annotations
-
-import hashlib
-import logging
-import re
+import hashlib, logging, re, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
-
-import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 
 LOG = logging.getLogger(__name__)
-
 BASE = "https://www.afd.fr"
-LISTING = f"{BASE}/en/calls-for-projects/list?status[ongoing]=ongoing&status[soon]=soon"
-
-OGP_WORDS = [
-    "governance", "transparency", "accountability", "open data", "civic",
-    "participation", "anti-corruption", "integrity", "justice", "rule of law",
-    "public finance", "budget", "procurement", "PFM", "citizen", "digital", "data"
-]
-
-@dataclass
-class Opportunity:
-    id: str
-    title: str
-    donor: str
-    url: str
-    deadline: Optional[str]
-    published_date: Optional[str]
-    status: Optional[str]
-    tags: List[str]
-    country_scope: Optional[str]
-    amount: Optional[str] = None
-    currency: Optional[str] = None
-
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-
-def _hash_id(*parts: str) -> str:
-    return "afd_" + hashlib.sha1(("::".join([p for p in parts if p])).encode("utf-8")).hexdigest()[:16]
-
-
-def _classify_tags(text: str) -> List[str]:
-    t = text.lower()
-    tags = set()
-    if any(k in t for k in ["digital", "data", "ai", "numérique", "données"]):
-        tags.add("ai_digital")
-    if any(k in t for k in ["budget", "finances publiques", "public finance", "pfm"]):
-        tags.add("budget")
-    if any(k in t for k in ["transparen", "accountab", "anti-corruption", "intégrité", "integrity"]):
-        tags.add("anti_corruption")
-    if any(k in t for k in ["civic", "participation", "citizen", "société civile"]):
-        tags.add("civic_participation")
-    if any(k in t for k in ["justice", "rule of law", "état de droit"]):
-        tags.add("justice")
-    if not tags:
-        tags.add("governance")
-    return sorted(tags)
-
+LIST_EN = f"{BASE}/en/calls-for-projects/list?status[ongoing]=ongoing&status[soon]=soon"
+LIST_FR = f"{BASE}/fr/appels-a-projets/liste?status[ongoing]=ongoing&status[soon]=soon"
 
 def _get(url: str) -> requests.Response:
     r = requests.get(url, timeout=30, headers={"User-Agent": "anansi/afd"})
     r.raise_for_status()
     return r
 
+OGP_WORDS = ["gouvernance","governance","transparency","transparence","accountability","open data","donn\u00e9es ouvertes","participation","soci\u00e9t\u00e9 civile","int\u00e9grit\u00e9","integrity","justice","rule of law","\u00e9tat de droit","finances publiques","public finance","budget","PFM","num\u00e9rique","digital","data"]
 
-def _parse_dates(text: str) -> (Optional[str], Optional[str]):
-    """
-    Returns (opening, closing) as ISO strings when found.
-    """
-    open_re = re.compile(r"(Opening|Ouverture)[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
-    close_re = re.compile(r"(Closing|Clôture)[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
+@dataclass
+class Opportunity:
+    id: str; title: str; donor: str; url: str
+    deadline: Optional[str]; published_date: Optional[str]; status: Optional[str]
+    tags: List[str]; country_scope: Optional[str]
+    amount: Optional[str]=None; currency: Optional[str]=None
+    def to_dict(self)->Dict: return asdict(self)
 
-    opening = None
-    closing = None
-    m = open_re.search(text)
-    if m:
-        try:
-            opening = dateparser.parse(m.group(2)).date().isoformat()
-        except Exception:
-            pass
-    m = close_re.search(text)
-    if m:
-        try:
-            closing = dateparser.parse(m.group(2)).date().isoformat()
-        except Exception:
-            pass
-    return opening, closing
+def _hash(*p: str)->str: return "afd_" + hashlib.sha1("::".join([x for x in p if x]).encode()).hexdigest()[:16]
 
+def _classify(text: str)->List[str]:
+    t = text.lower(); tags=set()
+    if any(k in t for k in ["digital","data","num\u00e9rique","donn\u00e9es"]): tags.add("ai_digital")
+    if any(k in t for k in ["budget","finances publiques","public finance","pfm"]): tags.add("budget")
+    if any(k in t for k in ["transparen","accountab","anti-corruption","int\u00e9grit","integrity"]): tags.add("anti_corruption")
+    if any(k in t for k in ["civic","participation","citizen","soci\u00e9t\u00e9 civile"]): tags.add("civic_participation")
+    if any(k in t for k in ["justice","rule of law","\u00e9tat de droit"]): tags.add("justice")
+    if not tags: tags.add("governance"); return sorted(tags)
 
-def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool = True) -> List[Dict]:
-    resp = _get(LISTING)
-    soup = BeautifulSoup(resp.text, "lxml")
-    cards = soup.select("article, div.card, div.views-row") or []
+def _parse_dates(text: str)->(Optional[str],Optional[str]):
+    open_re  = re.compile(r"(Opening|Ouverture)[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
+    close_re = re.compile(r"(Closing|Cl\u00f4ture)[^:]*:\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
+    o=c=None
+    m=open_re.search(text);  o=dateparser.parse(m.group(2)).date().isoformat() if m else None
+    m=close_re.search(text); c=dateparser.parse(m.group(2)).date().isoformat() if m else None
+    return o,c
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date() if since_days else None
-    out: List[Opportunity] = []
+def _extract_from_listing(list_url: str, max_pages: int, since_days: Optional[int])->List[Opportunity]:
+    out: List[Opportunity]=[]
+    cutoff=(datetime.now(timezone.utc)-timedelta(days=since_days)).date() if since_days else None
+    for page in range(max_pages):
+        url = f"{list_url}&page={page}" if page>0 else list_url
+        try: soup=BeautifulSoup(_get(url).text,"lxml")
+        except Exception as e: 
+            LOG.warning("AFD listing fetch failed %s: %s", url, e); break
 
-    for c in cards:
-        a = c.select_one("a")
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-        url = urljoin(BASE, a.get("href", ""))
-
-        # Quick governance filter on card text (we’ll refine with the detail page)
-        card_text = c.get_text(" ", strip=True)
-        if ogp_only and not any(w in card_text.lower() for w in [w.lower() for w in OGP_WORDS]):
-            # still fetch details; some cards have generic thumbnails but governance inside
-            pass
-
-        # fetch detail to read opening/closing & scope
-        try:
-            rd = _get(url)
-        except Exception:
-            continue
-        s2 = BeautifulSoup(rd.text, "lxml")
-        page_text = s2.get_text(" ", strip=True)
-
-        opening, closing = _parse_dates(page_text)
-        pub = None  # AFD often omits explicit publish date on calls
-
-        if cutoff and opening:
+        cards = soup.select("article.node--type-call-for-project, article.teaser, .view-content article, .card a[href*='/calls-for-projects/'], .card a[href*='/appels-a-projets/']")
+        links = []
+        for a in soup.select("a[href*='/calls-for-projects/'], a[href*='/appels-a-projets/']"):
+            title=a.get_text(strip=True); href=a.get("href","")
+            if not title or not href: continue
+            links.append((title, urljoin(BASE, href)))
+        # de-dup
+        seen=set()
+        for title,detail_url in links:
+            if detail_url in seen: continue
+            seen.add(detail_url)
             try:
-                if dateparser.parse(opening).date() < cutoff:
-                    continue
-            except Exception:
-                pass
+                s2=BeautifulSoup(_get(detail_url).text,"lxml")
+            except Exception: 
+                continue
+            page_text=s2.get_text(" ", strip=True)
+            opening,closing=_parse_dates(page_text)
+            # rough governance check
+            text_check=(title+" "+page_text).lower()
+            if any(w in text_check for w in [w.lower() for w in OGP_WORDS]):
+                pub=None; scope=None
+                chip = s2.select_one(".field--name-field-country, .field--name-field-geographical-area, .chips, .tags")
+                if chip: scope=chip.get_text(" ", strip=True)
+                status = "open" if (closing and dateparser.parse(closing).date() >= datetime.utcnow().date()) else ("forthcoming" if opening and not closing else None)
+                if cutoff and opening:
+                    try:
+                        if dateparser.parse(opening).date()<cutoff: continue
+                    except Exception: pass
+                out.append(Opportunity(
+                    id=_hash(title, detail_url), title=title, donor="AFD", url=detail_url,
+                    deadline=closing, published_date=pub, status=status, tags=_classify(text_check), country_scope=scope
+                ))
+    return out
 
-        scope = None
-        # try to find country/region chip
-        chip = s2.select_one(".field--name-field-country, .field--name-field-geographical-area, .chips, .tags")
-        if chip:
-            scope = chip.get_text(" ", strip=True)
-
-        tags = _classify_tags(title + " " + page_text)
-
-        opp = Opportunity(
-            id=_hash_id(title, url),
-            title=title,
-            donor="AFD",
-            url=url,
-            deadline=closing,
-            published_date=pub,
-            status="open" if (closing and dateparser.parse(closing).date() >= datetime.utcnow().date()) else "forthcoming" if opening and not closing else None,
-            tags=tags,
-            country_scope=scope,
-        )
-        out.append(opp)
-
-        if len(out) >= max_items:
-            break
-
-    # Sort by closing date ascending (soonest first)
-    def sort_key(o: Opportunity):
+def fetch(max_items: int=60, since_days: Optional[int]=365, ogp_only: bool=True)->List[Dict]:
+    ops=_extract_from_listing(LIST_EN, max_pages=3, since_days=since_days)
+    if not ops:
+        ops=_extract_from_listing(LIST_FR, max_pages=3, since_days=since_days)
+    # sort by earliest deadline first
+    def sk(o: Opportunity): 
         return dateparser.parse(o.deadline).date() if o.deadline else datetime.max.date()
-    out.sort(key=sort_key)
-
-    return [o.to_dict() for o in out]
-
+    ops.sort(key=sk)
+    return [o.to_dict() for o in ops[:max_items]]
 
 class Connector:
-    name = "afd"
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-    def fetch(self, **kwargs) -> List[Dict]:
-        return fetch(**{**self.kwargs, **kwargs})
-
-
-if __name__ == "__main__":
-    import pprint
-    pprint.pp(fetch(max_items=12))
+    name="afd"
+    def __init__(self, **kw): self.kwargs=kw
+    def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
