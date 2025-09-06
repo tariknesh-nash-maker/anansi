@@ -1,37 +1,35 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import hashlib, logging, re, requests, io
+import hashlib, logging, re, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-import feedparser
 
 LOG = logging.getLogger(__name__)
 
-# Public AfDB RSS (project-related procurement); RSS endpoints are documented/linked from AfDB procurement pages.
-FEEDS = [
-    # General Procurement Notices
-    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml",
-    # Specific Procurement Notices
-    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml",
-    # Requests for Expression of Interest
-    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/request-for-expression-of-interest-reoi/rss.xml",
-]
+BASE = "https://econsultant2.afdb.org"
+LISTING = f"{BASE}/advertisements"   # public listing of AfDB procurement adverts
 
 HEADERS = {
-    "User-Agent": "anansi/afdb (GitHub: tariknesh-nash-maker/anansi)",
-    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5",
-    "Accept-Language": "en",
+    # mimic a real browser; AfDB WAF tends to allow this origin
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Connection": "close",
+    "Referer": "https://econsultant2.afdb.org/",
 }
 
 OGP_HINTS = [
     "governance","transparen","accountab","open data","digital","ict","pfm",
     "public finance","budget","audit","integrity","anti-corruption","justice","rule of law",
-    "citizen","participation","civic"
+    "citizen","participation","civic","procurement","monitoring","evaluation","data"
 ]
-DL_RX = re.compile(r"(?:Deadline|Closing)\s*(?:Date|Time)?\s*[:\-]?\s*(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
+DL_RX = re.compile(r"(?:Deadline|Closing)\s*(?:Date|Time)?\s*[:\-]?\s*"
+                   r"(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})", re.I)
 
 @dataclass
 class Opportunity:
@@ -53,36 +51,55 @@ def _classify(text: str)->List[str]:
     if not tags: tags.add("governance")
     return sorted(tags)
 
-def _fetch_feed(url: str):
+def _get(url: str) -> BeautifulSoup:
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    # parse from bytes to control headers/UA
-    return feedparser.parse(io.BytesIO(r.content))
+    return BeautifulSoup(r.text, "lxml")
 
-def fetch(max_items: int=60, since_days: Optional[int]=180, ogp_only: bool=True)->List[Dict]:
-    cutoff = (datetime.now(timezone.utc)-timedelta(days=since_days)).date() if since_days else None
+def _pages(max_pages: int = 5) -> List[str]:
+    # eConsultant2 paginates with ?page=N (0-based). We'll probe a few pages.
+    return [LISTING] + [f"{LISTING}?page={i}" for i in range(1, max_pages)]
+
+def fetch(max_items: int = 60, since_days: Optional[int] = 180, ogp_only: bool = True) -> List[Dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date() if since_days else None
     out: List[Opportunity] = []
+    seen = set()
 
-    for feed_url in FEEDS:
+    for url in _pages(max_pages=6):
         try:
-            feed = _fetch_feed(feed_url)
-        except Exception as e:
-            LOG.warning("AfDB RSS failed %s: %s", feed_url, e)
+            soup = _get(url)
+        except requests.HTTPError as e:
+            LOG.warning("AfDB eConsultant2 list failed %s: %s", url, e)
             continue
 
-        for e in feed.entries:
-            title = (e.get("title") or "").strip()
-            link  = e.get("link") or ""
-            summary = (e.get("summary") or e.get("description") or "").strip()
-            # published
-            pub = None
-            if e.get("published"):
-                try: pub = dateparser.parse(e["published"]).date().isoformat()
-                except Exception: pass
-            elif e.get("updated"):
-                try: pub = dateparser.parse(e["updated"]).date().isoformat()
-                except Exception: pass
+        # Each card has a link to /advertisement/<id>
+        links = soup.select("a[href*='/advertisement/']")
+        for a in links:
+            href = a.get("href","")
+            title = a.get_text(" ", strip=True)
+            if not href or not title: continue
+            detail = urljoin(BASE, href)
+            if detail in seen: continue
+            seen.add(detail)
 
+            # detail page
+            try:
+                s2 = _get(detail)
+            except requests.HTTPError:
+                continue
+
+            text = s2.get_text(" ", strip=True)
+            # published (first <time> or "Posted on")
+            pub = None
+            t = s2.select_one("time")
+            if t:
+                try: pub = dateparser.parse(t.get_text(" ", strip=True)).date().isoformat()
+                except Exception: pass
+            else:
+                m = re.search(r"(Posted on|Publication Date)\s*[:\-]?\s*([0-9]{1,2}\s+\w+\s+\d{4})", text, re.I)
+                if m:
+                    try: pub = dateparser.parse(m.group(2)).date().isoformat()
+                    except Exception: pass
             if cutoff and pub:
                 try:
                     if dateparser.parse(pub).date() < cutoff:
@@ -90,16 +107,16 @@ def fetch(max_items: int=60, since_days: Optional[int]=180, ogp_only: bool=True)
                 except Exception:
                     pass
 
-            text = f"{title} {summary}"
-            if ogp_only and not any(h in text.lower() for h in OGP_HINTS):
-                continue
-
-            # deadline (best-effort)
+            # deadline
             deadline = None
-            m = DL_RX.search(summary) or DL_RX.search(title)
+            m = DL_RX.search(text)
             if m:
                 try: deadline = dateparser.parse(m.group(1)).date().isoformat()
                 except Exception: pass
+
+            # quick governance filter
+            if ogp_only and not any(h in (title + " " + text).lower() for h in OGP_HINTS):
+                continue
 
             status = None
             try:
@@ -109,33 +126,32 @@ def fetch(max_items: int=60, since_days: Optional[int]=180, ogp_only: bool=True)
                 pass
 
             out.append(Opportunity(
-                id=_hash(title, link), title=title, donor="AfDB", url=link,
-                deadline=deadline, published_date=pub, status=status,
-                tags=_classify(text), country_scope=None
+                id=_hash(title, detail),
+                title=title.strip(),
+                donor="AfDB",
+                url=detail,
+                deadline=deadline,
+                published_date=pub,
+                status=status,
+                tags=_classify(title + " " + text),
+                country_scope=None
             ))
-
             if len(out) >= max_items:
                 break
         if len(out) >= max_items:
             break
 
-    # de-dup on URL
-    uniq, seen = [], set()
-    for o in out:
-        if o.url in seen: continue
-        seen.add(o.url); uniq.append(o)
-
-    # sort (deadline soonest, else newest)
+    # sort: nearest deadline, then newest publication
     def sk(o: Opportunity):
         try: dl = dateparser.parse(o.deadline).date() if o.deadline else datetime.max.date()
         except Exception: dl = datetime.max.date()
         try: pu = dateparser.parse(o.published_date).date() if o.published_date else datetime.min.date()
         except Exception: pu = datetime.min.date()
         return (dl, -int(pu.strftime("%s")))
-    uniq.sort(key=sk)
-    return [o.to_dict() for o in uniq[:max_items]]
+    out.sort(key=sk)
+    return [o.to_dict() for o in out[:max_items]]
 
 class Connector:
-    name="afdb"
-    def __init__(self, **kw): self.kwargs=kw
+    name = "afdb"
+    def __init__(self, **kw): self.kwargs = kw
     def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
