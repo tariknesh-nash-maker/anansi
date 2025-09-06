@@ -47,17 +47,15 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
     out: List[Opportunity] = []
     page, page_size = 1, min(50, max_items)
 
-    # Build expert query
+    # Build expert query: title OR-clauses + TED-compliant date clause using today(-N)
     if ogp_only:
         clauses = [f'(notice-title ~ ("{k}"))' for k in KEYWORDS]
         title_q = "(" + " OR ".join(clauses) + ")"
     else:
         title_q = '(notice-title ~ ("*"))'
-    if since_days:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat()
-        q = f'{title_q} AND (publication-date >= {cutoff})'
-    else:
-        q = title_q
+
+    date_q = f"(publication-date >= today(-{since_days}))" if since_days else ""
+    q = f"{title_q} AND {date_q}" if date_q else title_q
 
     headers = {"Accept": "application/json"}
     while len(out) < max_items:
@@ -66,7 +64,7 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
             "fields": ["publication-number", "notice-title", "publication-date"],
             "page": page,
             "limit": page_size,
-            "scope": "ACTIVE",                 # ACTIVE | LATEST | ALL
+            "scope": "ACTIVE",
             "checkQuerySyntax": False,
             "paginationMode": "PAGE_NUMBER",
         }
@@ -88,16 +86,15 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
             if pub:
                 try: pub = dateparser.parse(pub).date().isoformat()
                 except Exception: pass
-
             url = f"https://ted.europa.eu/en/notice/-/detail/{pubnum}" if pubnum else ""
             out.append(Opportunity(
                 id=_hash(title, url or (pubnum or "")),
                 title=title,
                 donor="EU (TED)",
                 url=url,
-                deadline=None,                 # TED Search API rarely exposes deadline directly
+                deadline=None,
                 published_date=pub,
-                status="open",                 # within ACTIVE scope
+                status="open",     # ACTIVE scope
                 tags=_classify(title),
                 country_scope=None,
             ))
