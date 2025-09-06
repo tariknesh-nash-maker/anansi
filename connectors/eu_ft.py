@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
-EU — TED (Tenders Electronic Daily) Search API v3
-Docs: POST https://api.ted.europa.eu/v3/notices/search
-Refs: https://docs.ted.europa.eu/api/latest/search.html
-
-We query ACTIVE notices and keyword-filter for OGP-ish terms.
-Returns normalized dicts (id, title, donor, url, deadline, published_date, status, tags, country_scope).
-Note: TED returns publication dates reliably; deadlines are not always present => left None if unknown.
-"""
 from __future__ import annotations
-import hashlib, logging, os, re, requests
+import hashlib, logging, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -56,56 +47,59 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
     out: List[Opportunity] = []
     page, page_size = 1, min(50, max_items)
 
-    # TED “expert query” (see docs): use title matches + date window; ACTIVE scope means currently valid notices
+    # Build expert query
     if ogp_only:
-        kw = " OR ".join([f'"{k}"' for k in KEYWORDS])
-        title_query = f'(notice-title ~ ({kw}))'
+        clauses = [f'(notice-title ~ ("{k}"))' for k in KEYWORDS]
+        title_q = "(" + " OR ".join(clauses) + ")"
     else:
-        title_query = '(notice-title ~ ("*"))'
+        title_q = '(notice-title ~ ("*"))'
     if since_days:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat()
-        date_clause = f'(publication-date >= {cutoff})'
-        q = f"{title_query} AND {date_clause}"
+        q = f'{title_q} AND (publication-date >= {cutoff})'
     else:
-        q = title_query
+        q = title_q
 
+    headers = {"Accept": "application/json"}
     while len(out) < max_items:
         body = {
             "query": q,
-            "fields": ["publication-number","notice-title","publication-date","place-of-performance","country"],
+            "fields": ["publication-number", "notice-title", "publication-date"],
             "page": page,
             "limit": page_size,
-            "scope": "ACTIVE",
+            "scope": "ACTIVE",                 # ACTIVE | LATEST | ALL
             "checkQuerySyntax": False,
             "paginationMode": "PAGE_NUMBER",
         }
-        r = requests.post(API, json=body, timeout=30, headers={"Accept": "application/json"})
-        r.raise_for_status()
+        r = requests.post(API, json=body, timeout=30, headers=headers)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            LOG.warning("EU (TED) failed page %s: %s – body=%s", page, e, r.text[:500])
+            break
+
         data = r.json()
         results = data.get("results") or data.get("items") or []
         if not results: break
 
-        for item in results:
-            # Fields are returned as flat keys as per docs/examples
-            pubnum = item.get("publication-number") or item.get("publicationNumber")
-            title = item.get("notice-title") or item.get("noticeTitle") or ""
-            pub = item.get("publication-date") or item.get("publicationDate") or None
+        for it in results:
+            pubnum = it.get("publication-number") or it.get("publicationNumber")
+            title = (it.get("notice-title") or it.get("noticeTitle") or "").strip()
+            pub = it.get("publication-date") or it.get("publicationDate")
             if pub:
                 try: pub = dateparser.parse(pub).date().isoformat()
                 except Exception: pass
-            url = f"https://ted.europa.eu/en/notice/-/detail/{pubnum}" if pubnum else ""
 
-            # we rarely get a formal deadline from TED search; leave None (downstream can enrich if needed)
+            url = f"https://ted.europa.eu/en/notice/-/detail/{pubnum}" if pubnum else ""
             out.append(Opportunity(
-                id=_hash(title, url or pubnum or ""),
-                title=title.strip(),
+                id=_hash(title, url or (pubnum or "")),
+                title=title,
                 donor="EU (TED)",
                 url=url,
-                deadline=None,
+                deadline=None,                 # TED Search API rarely exposes deadline directly
                 published_date=pub,
-                status="open",  # ACTIVE scope
+                status="open",                 # within ACTIVE scope
                 tags=_classify(title),
-                country_scope=item.get("country") or item.get("place-of-performance") or None,
+                country_scope=None,
             ))
             if len(out) >= max_items: break
 
@@ -117,4 +111,4 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
 class Connector:
     name = "eu"
     def __init__(self, **kw): self.kwargs = kw
-    def fetch(self, **kw) -> List[Dict]: return fetch(**{**self.kwargs, **kw})
+    def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
