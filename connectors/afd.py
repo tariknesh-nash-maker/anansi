@@ -90,14 +90,25 @@ def _extract_from_listing(list_url: str, max_pages: int, since_days: Optional[in
                 ))
     return out
 
-def fetch(max_items: int=60, since_days: Optional[int]=365, ogp_only: bool=True)->List[Dict]:
-    ops=_extract_from_listing(LIST_EN, max_pages=3, since_days=since_days)
+def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool = True) -> List[Dict]:
+    ops = _extract_from_listing(LIST_EN, max_pages=3, since_days=since_days)
     if not ops:
-        ops=_extract_from_listing(LIST_FR, max_pages=3, since_days=since_days)
-    # sort by earliest deadline first
-    def sk(o: Opportunity): 
-        return dateparser.parse(o.deadline).date() if o.deadline else datetime.max.date()
-    ops.sort(key=sk)
+        ops = _extract_from_listing(LIST_FR, max_pages=3, since_days=since_days)
+
+    # if strict filter produced nothing, widen once so caller sees what's live
+    if not ops and ogp_only:
+        LOG.info("AFD: no results with ogp_only=True — widening filter")
+        ops = _extract_from_listing(LIST_EN, max_pages=3, since_days=since_days)
+        if not ops:
+            ops = _extract_from_listing(LIST_FR, max_pages=3, since_days=since_days)
+
+    # Sort by earliest deadline first
+    def sort_key(o: Opportunity):
+        try:
+            return dateparser.parse(o.deadline).date() if o.deadline else datetime.max.date()
+        except Exception:
+            return datetime.max.date()
+    ops.sort(key=sort_key)
     return [o.to_dict() for o in ops[:max_items]]
 
 class Connector:
