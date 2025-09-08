@@ -19,15 +19,12 @@ LIST_FR_ALL = f"{BASE}/fr/appels-a-projets/liste"
 
 HEADERS = {"User-Agent": "anansi/afd", "Accept-Language": "en,fr;q=0.9"}
 
-# Only accept detail URLs like /en/calls-for-projects/<slug> or /fr/appels-a-projets/<slug>
 DETAIL_PATTERNS = [
     re.compile(r"^/en/calls-for-projects/[^/?#]+/?$", re.I),
     re.compile(r"^/fr/appels-a-projets/[^/?#]+/?$", re.I),
 ]
-# Obvious non-detail slugs to ignore
 BLACKLIST_SEGMENTS = {"list", "liste", "previous", "precedents", "voir", "see", "en", "fr"}
 
-# Closing date (EN/FR) extraction
 CLOSE_RE = re.compile(
     r"(?:Closing|Cl[ôo]ture|Date\s+limite)\s*(?:date|:)?\s*"
     r"(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})",
@@ -69,13 +66,9 @@ def _get(url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "lxml")
 
 def _is_detail_url(abs_url: str, title_text: str) -> bool:
-    """
-    Accept only detail pages (not language switchers, lists, or 'see previous').
-    """
     try:
         p = urlparse(abs_url)
         path = p.path.rstrip("/")
-        # block obvious nav/localization pages by title
         junk_titles = {
             "fr - français", "en - english",
             "list of calls for projects", "liste des appels à projets",
@@ -83,10 +76,8 @@ def _is_detail_url(abs_url: str, title_text: str) -> bool:
         }
         if title_text.strip().lower() in junk_titles:
             return False
-        # block blacklisted segments
         if any(seg in path.lower().split("/") for seg in BLACKLIST_SEGMENTS):
             return False
-        # accept only if matches detail patterns
         return any(rx.match(path) for rx in DETAIL_PATTERNS)
     except Exception:
         return False
@@ -97,7 +88,6 @@ def _parse_detail(detail_url: str) -> Optional[Opportunity]:
     except requests.HTTPError:
         return None
 
-    # Title
     title_el = s2.select_one("h1, .page-title, .node__title")
     title = (title_el.get_text(" ", strip=True) if title_el else "").strip()
     if not title:
@@ -105,13 +95,11 @@ def _parse_detail(detail_url: str) -> Optional[Opportunity]:
 
     text = s2.get_text(" ", strip=True)
 
-    # Country/region chips (best effort)
     scope = None
     chip = s2.select_one(".field--name-field-country, .field--name-field-geographical-area, .chips, .tags")
     if chip:
         scope = chip.get_text(" ", strip=True)
 
-    # Closing date is REQUIRED to keep the item
     deadline = None
     m = CLOSE_RE.search(text)
     if m:
@@ -121,9 +109,8 @@ def _parse_detail(detail_url: str) -> Optional[Opportunity]:
             deadline = None
 
     if not deadline:
-        return None  # drop pages without a deadline
+        return None
 
-    # Only future deadlines
     today = datetime.now(timezone.utc).date()
     try:
         if dateparser.parse(deadline).date() <= today:
@@ -148,14 +135,14 @@ def _extract(list_url: str, max_pages: int) -> List[Opportunity]:
     out: List[Opportunity] = []
     seen = set()
     for page in range(max_pages):
-        url = f"{list_url}&page={page}" if ("?" in list_url and page>0) else (f"{list_url}?page={page}" if page>0 else list_url)
+        url = f"{list_url}&page={page}" if ("?" in list_url and page > 0) else (f"{list_url}?page={page}" if page > 0 else list_url)
         try:
             soup = _get(url)
         except requests.HTTPError as e:
             LOG.warning("AFD listing failed %s: %s", url, e); break
 
         for a in soup.select("a[href*='/calls-for-projects/'], a[href*='/appels-a-projets/']"):
-            href = a.get("href",""); title=a.get_text(strip=True)
+            href = a.get("href", ""); title = a.get_text(strip=True)
             if not href or not title:
                 continue
             detail = urljoin(BASE, href)
@@ -170,13 +157,11 @@ def _extract(list_url: str, max_pages: int) -> List[Opportunity]:
     return out
 
 def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool = True) -> List[Dict]:
-    # Crawl both filtered and unfiltered lists to be safe
     raw = []
     for lst in (LIST_EN, LIST_FR, LIST_EN_ALL, LIST_FR_ALL):
         raw.extend(_extract(lst, max_pages=5))
     LOG.info("AFD: detail pages with future deadlines found=%s", len(raw))
 
-    # OGP filter (client-side)
     if ogp_only:
         filtered = []
         for o in raw:
@@ -186,15 +171,16 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool =
     else:
         filtered = raw
 
-    # Sort by earliest deadline first
     def sk(o: Opportunity):
-        try: return dateparser.parse(o.deadline).date()
-        except Exception: return datetime.max.date()
-    filtered.sort(key=sk)
+        try:
+            return dateparser.parse(o.deadline).date()
+        except Exception:
+            return datetime.max.date()
 
+    filtered.sort(key=sk)
     return [o.to_dict() for o in filtered[:max_items]]
 
 class Connector:
-    name="afd"
-    def __init__(self, **kw): self.kwargs=kw
-    def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
+    name = "afd"
+    def __init__(self, **kw): self.kwargs = kw
+    def fetch(self, **kw) -> List[Dict]: return fetch(**{**self.kwargs, **kw})
