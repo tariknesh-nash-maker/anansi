@@ -6,11 +6,12 @@ import hashlib
 import inspect
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 
 # --------- Connectors (import with graceful fallbacks) ----------------------
 EU_NAME = "EU"
 try:
-    # Use TED connector if present
+    # Prefer the newer TED connector if present
     from connectors.eu import fetch as fetch_eu
     EU_NAME = "EU (TED)"
 except Exception:
@@ -18,7 +19,7 @@ except Exception:
         from connectors.eu_ft import fetch as fetch_eu
         EU_NAME = "EU F&T"
     except Exception:
-        fetch_eu = None
+        fetch_eu = None  # EU unavailable
 
 from connectors.undp import fetch as fetch_undp
 from connectors.afdb import fetch as fetch_afdb
@@ -41,6 +42,7 @@ STATE_FILE = Path("state.json")
 
 
 def _sig(item: dict) -> str:
+    """Stable signature to dedupe across runs (normalized fields)."""
     base = f"{item.get('title','')}|{item.get('url','')}|{item.get('deadline','')}|{item.get('donor','')}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
@@ -55,7 +57,15 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Atomic write to avoid corrupt state on abrupt job termination."""
+    data = json.dumps(state, indent=2, ensure_ascii=False)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=STATE_FILE.parent, encoding="utf-8") as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    os.replace(tmp_path, STATE_FILE)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -73,12 +83,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _render_line(op: dict) -> str:
+    """Slack-friendly single-line formatter."""
     url = op.get("url") or ""
     title = op.get("title") or "Untitled"
     donor = op.get("donor") or "Unknown"
     deadline = op.get("deadline") or "N/A"
     themes = op.get("themes") or ["Open Government"]
     theme = themes[0] if isinstance(themes, list) and themes else str(themes)
+
     loc_list = op.get("country_scope") or []
     loc = " / ".join(loc_list) if isinstance(loc_list, list) else str(loc_list)
     prefix = f"{loc} — " if (loc and not title.lower().startswith(loc.lower())) else ""
@@ -106,7 +118,7 @@ def _safe_fetch(name: str, fn, desired_kwargs: dict) -> list:
     try:
         items = fn(**accepted) if accepted else fn()
     except TypeError:
-        # If we somehow still got a TypeError, try no-arg call
+        # If we still got a TypeError, try no-arg call
         items = fn()
     except Exception as e:
         print(f"[warn] {name} failed: {e}")
@@ -223,7 +235,7 @@ def main():
 
     # ---------------------- Slack digest -------------------------------------
     header = f"*New funding opportunities ({len(new_items)})* — {UTC_DATE}"
-    capacity = max(1, MAX_LINES - 1)
+    capacity = max(1, MAX_LINES - 1)  # header + items
     lines = [header]
     for op in new_items[:capacity]:
         lines.append(_render_line(op))
