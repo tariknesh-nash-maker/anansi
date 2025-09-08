@@ -185,21 +185,46 @@ def _parse_program(url: str, since: Optional[datetime]) -> Optional[Opportunity]
             return None
     return opp
 
-def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool = True) -> List[Dict]:
+def fetch(
+    max_items: int = 60,
+    since_days: Optional[int] = 365,
+    ogp_only: bool = True,
+    future_only: bool = True,           # <— new
+) -> List[Dict]:
     since_dt = (datetime.now(timezone.utc) - timedelta(days=since_days)) if since_days else None
     out: List[Opportunity] = []
+    today = datetime.now(timezone.utc).date()   # compare in UTC (deadlines are dates)
+
     for url in _discover_program_links():
         if len(out) >= max_items:
             break
         opp = _parse_program(url, since_dt)
         if not opp:
             continue
+
+        # --- NEW: require a deadline strictly AFTER today
+        if future_only:
+            if not opp.deadline:
+                continue
+            try:
+                d = dateparser.parse(opp.deadline).date()
+            except Exception:
+                continue
+            if d <= today:                # strictly after today
+                continue
+
         text_check = (opp.title + " " + " ".join(opp.tags)).lower()
         if ogp_only and not any(h in text_check for h in [h.lower() for h in OGP_HINTS]):
             continue
-        out.append(opp)
 
-    # Sort: nearest deadline first (then title)
+        # keep status consistent (optional)
+        opp.status = "open"
+
+        out.append(opp)
+        if len(out) >= max_items:
+            break
+
+    # sort & dedup (unchanged) ...
     def sk(o: Opportunity):
         try:
             return (dateparser.parse(o.deadline).date() if o.deadline else datetime.max.date(), o.title)
@@ -207,12 +232,12 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 365, ogp_only: bool =
             return (datetime.max.date(), o.title)
 
     out.sort(key=sk)
-    # de-dup by URL
     seen, uniq = set(), []
     for o in out:
         if o.url in seen: continue
         seen.add(o.url); uniq.append(o)
     return [o.to_dict() for o in uniq[:max_items]]
+# --------------------------------------------------------------------------
 
 class Connector:
     name = "afdb"
