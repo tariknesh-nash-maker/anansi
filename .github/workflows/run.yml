@@ -2,7 +2,7 @@ name: funding-watcher
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
+    - cron: '0 10 * * *'
   workflow_dispatch: {}
 
 jobs:
