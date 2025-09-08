@@ -5,6 +5,8 @@ connectors = ["worldbank", "undp", "eu_ft", "afdb", "afd"]
 regions = ["africa", "mena"]         # used to filter text
 themes  = ["ai_digital","budget","anti_corruption","climate","open_parliament","cso_support"]
 channel = "news_westnorthafrica"
+ANANSI_REQUIRE_DEADLINE=true
+
 
 [slack]
 webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
