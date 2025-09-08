@@ -17,18 +17,11 @@ KEYWORDS = [
 
 @dataclass
 class Opportunity:
-    id: str
-    title: str
-    donor: str
-    url: str
-    deadline: Optional[str]
-    published_date: Optional[str]
-    status: Optional[str]
-    tags: List[str]
-    country_scope: Optional[str]
-    amount: Optional[str] = None
-    currency: Optional[str] = None
-    def to_dict(self) -> Dict: return asdict(self)
+    id: str; title: str; donor: str; url: str
+    deadline: Optional[str]; published_date: Optional[str]; status: Optional[str]
+    tags: List[str]; country_scope: Optional[str]
+    amount: Optional[str]=None; currency: Optional[str]=None
+    def to_dict(self)->Dict: return asdict(self)
 
 def _hash(*parts: str) -> str:
     return "eu_" + hashlib.sha1("::".join([p for p in parts if p]).encode()).hexdigest()[:16]
@@ -43,21 +36,27 @@ def _classify(text: str) -> List[str]:
     if not tags: tags.add("governance")
     return sorted(tags)
 
-def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool = True) -> List[Dict]:
-    out: List[Opportunity] = []
-    page, page_size = 1, min(50, max_items)
-
-    # Build expert query: title OR-clauses + TED-compliant date clause using today(-N)
+def _query(since_days: Optional[int], ogp_only: bool) -> str:
     if ogp_only:
         clauses = [f'(notice-title ~ ("{k}"))' for k in KEYWORDS]
         title_q = "(" + " OR ".join(clauses) + ")"
     else:
         title_q = '(notice-title ~ ("*"))'
+    if since_days:
+        # TED expert search expects YYYYMMDD or today(-N)
+        return f'{title_q} AND (publication-date >= today(-{since_days}))'
+    return title_q
 
-    date_q = f"(publication-date >= today(-{since_days}))" if since_days else ""
-    q = f"{title_q} AND {date_q}" if date_q else title_q
+def _call_ted(body: Dict) -> Dict:
+    r = requests.post(API, json=body, timeout=30, headers={"Accept": "application/json"})
+    r.raise_for_status()
+    return r.json()
 
-    headers = {"Accept": "application/json"}
+def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool = True) -> List[Dict]:
+    out: List[Opportunity] = []
+    page, page_size = 1, min(50, max_items)
+
+    q = _query(since_days, ogp_only)
     while len(out) < max_items:
         body = {
             "query": q,
@@ -68,16 +67,22 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
             "checkQuerySyntax": False,
             "paginationMode": "PAGE_NUMBER",
         }
-        r = requests.post(API, json=body, timeout=30, headers=headers)
         try:
-            r.raise_for_status()
+            data = _call_ted(body)
         except requests.HTTPError as e:
-            LOG.warning("EU (TED) failed page %s: %s – body=%s", page, e, r.text[:500])
-            break
+            # Fallback: drop the date clause (keep ACTIVE), then filter client-side
+            LOG.warning("EU (TED) query failed (%s). Retrying without date clause.", e)
+            q_nodate = _query(None, ogp_only)
+            body["query"] = q_nodate
+            try:
+                data = _call_ted(body)
+            except Exception as e2:
+                LOG.warning("EU (TED) fallback also failed: %s", e2)
+                break
 
-        data = r.json()
         results = data.get("results") or data.get("items") or []
-        if not results: break
+        if not results:
+            break
 
         for it in results:
             pubnum = it.get("publication-number") or it.get("publicationNumber")
@@ -86,6 +91,13 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
             if pub:
                 try: pub = dateparser.parse(pub).date().isoformat()
                 except Exception: pass
+            # client-side since_days filter if needed
+            if since_days and pub:
+                try:
+                    if dateparser.parse(pub).date() < (datetime.now(timezone.utc) - timedelta(days=since_days)).date():
+                        continue
+                except Exception:
+                    pass
             url = f"https://ted.europa.eu/en/notice/-/detail/{pubnum}" if pubnum else ""
             out.append(Opportunity(
                 id=_hash(title, url or (pubnum or "")),
@@ -94,7 +106,7 @@ def fetch(max_items: int = 60, since_days: Optional[int] = 120, ogp_only: bool =
                 url=url,
                 deadline=None,
                 published_date=pub,
-                status="open",     # ACTIVE scope
+                status="open",
                 tags=_classify(title),
                 country_scope=None,
             ))
