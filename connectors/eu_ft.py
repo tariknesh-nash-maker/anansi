@@ -142,9 +142,32 @@ def _fetch_backcompat(ogp_only: bool = True, since_days: int = 90, **kwargs):
             pass
     return items
 
+
+# ---------------- EU F&T connector: non-recursive wiring ----------------
+def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True):
+    """
+    Call the actual EU F&T scraping/API logic here.
+    Return a list of dicts with keys: title, source, deadline, country, topic, url, summary
+    """
+    # EXAMPLE stub:
+    # items = _scrape_eu_ft(days_back=days_back)
+    # if ogp_only:
+    #     from filters import ogp_relevant, is_excluded
+    #     items = [it for it in items
+    #              if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
+    #              and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+    # return items
+    raise NotImplementedError("Hook up _euft_fetch_impl to your EU F&T logic.")
+
+class Connector:
+    def fetch(self, days_back: int = 90):
+        # DO NOT call fetch() here.
+        return _euft_fetch_impl(days_back=days_back, ogp_only=True)
+
+# ---- Back-compat procedural API (for existing aggregator) ----
 def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    # IMPORTANT: call the helper, not fetch() itself (prevents recursion)
-    return _fetch_backcompat(ogp_only=ogp_only, since_days=since_days, **kwargs)
+    # DO NOT call Connector().fetch() here.
+    return _euft_fetch_impl(days_back=since_days, ogp_only=ogp_only)
 
 def accepted_args():
     return ["ogp_only", "since_days"]
