@@ -1,117 +1,110 @@
+# connectors/afdb.py
+# African Development Bank – Project-related Procurement RSS (GPN + SPN)
+# Feeds are public (Drupal views RSS). We parse the latest entries.
+#
+# Env:
+#   AFDB_MAX (default 40)
+#   AFDB_DEBUG (0/1)
+
 from __future__ import annotations
-import re, html
 from typing import List, Dict, Any
-import requests
-from bs4 import BeautifulSoup
-from utils.date_parse import to_iso_date
+import os, time
+import feedparser
+from datetime import datetime, timedelta
 
-HEADERS = {"User-Agent":"Mozilla/5.0 (compatible; anansi/1.0)"}
-
-URLS = [
-    # Open consultancy opportunities
-    "https://www.afdb.org/en/projects-and-operations/procurement/consultancy",
-    # Notices (EOIs/RFPs) – filter client-side by “Ongoing/Open” if present in DOM
-    "https://www.afdb.org/en/projects-and-operations/procurement/notices",
+# Confirmed RSS endpoints (project-related procurement)
+FEEDS = [
+    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml",
+    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml",
 ]
 
-def _parse_listing(url: str) -> List[Dict[str,Any]]:
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    out: List[Dict[str,Any]] = []
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
-    # Generic listing items
-    for item in soup.select(".c-listing__item, article, li"):
-        a = item.select_one("a[href]")
-        if not a: 
-            continue
-        title = a.get_text(" ", strip=True)
-        href = a.get("href","")
-        link = href if href.startswith("http") else f"https://www.afdb.org{href}"
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip().lower() in ("1","true","yes")
 
-        blob = item.get_text(" ", strip=True)
-        # try extracting “Deadline” if present
-        deadline = None
-        m = re.search(r"(deadline|closing\s*date|closing\s*on)\s*[:\-]?\s*(.+?)($|\s{2,}|\. )", blob, flags=re.I)
-        if m:
-            deadline = to_iso_date(m.group(2))
+def _to_iso_from_struct(tm) -> str | None:
+    try:
+        return datetime(*tm[:6]).date().isoformat()
+    except Exception:
+        return None
 
-        # country occasionally in badges/labels
-        country = ""
-        badge = item.select_one(".c-badge, .o-badge, .badge")
-        if badge:
-            country = badge.get_text(" ", strip=True)
+def _fetch_feed(url: str, debug: bool = False):
+    if debug:
+        print(f"[afdb] GET {url}")
+    # feedparser handles redirects + gzip
+    return feedparser.parse(url)
 
-        out.append({
-            "title": html.unescape(title),
-            "source": "AfDB",
-            "deadline": deadline,
-            "country": country,
-            "topic": None,
-            "url": link,
-            "summary": blob.lower(),
-        })
-    return out
+def _afdb_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
+    debug = _env_bool("AFDB_DEBUG", False)
+    max_items = _env_int("AFDB_MAX", 40)
+    since = datetime.utcnow().date() - timedelta(days=days_back)
 
-class Connector:
-    def fetch(self, days_back: int = 60) -> List[Dict[str,Any]]:
-        out: List[Dict[str,Any]] = []
-        for u in URLS:
-            try:
-                out.extend(_parse_listing(u))
-            except Exception:
-                continue
-        # Filter obvious “Closed/Cancelled”
-        filtered = []
-        for it in out:
-            s = it.get("summary","")
-            if any(x in s for x in ["closed", "cancelled", "canceled"]):
-                continue
-            filtered.append(it)
-        return filtered
-
-# ---- Back-compat procedural API (for existing aggregator) ----
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    """
-    Backwards-compatible wrapper so old aggregator imports work:
-      from connectors.X import fetch as fetch_X
-    """
-    items = Connector().fetch(days_back=since_days)
-    if ogp_only:
+    items: List[Dict[str, Any]] = []
+    for url in FEEDS:
         try:
-            from filters import ogp_relevant
-            filt = []
-            for it in items:
-                text = f"{it.get('title','')} {it.get('summary','')}"
-                if ogp_relevant(text):
-                    filt.append(it)
-            items = filt
-        except Exception:
-            # If filters module not present, just return items
-            pass
-    return items
-    
-def _fetch_backcompat(ogp_only: bool = True, since_days: int = 60, **kwargs):
-    items = Connector().fetch(days_back=since_days)
+            fp = _fetch_feed(url, debug=debug)
+        except Exception as e:
+            if debug:
+                print(f"[afdb] WARN feed error: {e}")
+            continue
+        for e in fp.entries[: max_items * 2]:
+            title = (getattr(e, "title", "") or "").strip()
+            link  = (getattr(e, "link", "") or "").strip()
+            if not title or not link:
+                continue
+
+            # Use published/updated if provided
+            pub_iso = None
+            if getattr(e, "published_parsed", None):
+                pub_iso = _to_iso_from_struct(e.published_parsed)
+            elif getattr(e, "updated_parsed", None):
+                pub_iso = _to_iso_from_struct(e.updated_parsed)
+
+            # Keep recent items if we have a date; if not, keep anyway (permissive)
+            keep = True
+            if pub_iso:
+                keep = pub_iso >= since.isoformat()
+            if not keep:
+                continue
+
+            items.append({
+                "title": title,
+                "source": "AfDB",
+                "deadline": None,            # not present in the feed
+                "country": "",
+                "topic": None,
+                "url": link,
+                "summary": (getattr(e, "summary", "") or title).lower(),
+            })
+            if len(items) >= max_items:
+                break
+        if len(items) >= max_items:
+            break
+
+    # Optional OGP/exclusion pass; never zero-out
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            items = [it for it in items
-                     if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
-                     and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+            preferred = [it for it in items if ogp_relevant(f"{it['title']} {it.get('summary','')}")]
+            items = preferred or items
+            items = [it for it in items if not is_excluded(f"{it['title']} {it.get('summary','')}")]
         except Exception:
             pass
+
     return items
 
-def fetch(ogp_only: bool = True, since_days: int = 60, **kwargs):
-    items = Connector().fetch(days_back=since_days)
-    try:
-        from filters import is_excluded
-        # Only drop obvious auction/sale junk — AfDB copy is sparse; keep it permissive
-        items = [it for it in items if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
-    except Exception:
-        pass
-    return items
+class Connector:
+    def fetch(self, days_back: int = 90):
+        return _afdb_fetch(days_back=days_back, ogp_only=True)
+
+def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+    return _afdb_fetch(days_back=since_days, ogp_only=ogp_only)
 
 def accepted_args():
     return ["ogp_only", "since_days"]
