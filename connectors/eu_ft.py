@@ -1,129 +1,145 @@
 # connectors/eu_ft.py
-# EU: Tenders Electronic Daily (TED) Search API v3
-# - Anonymous access
-# - Expert-query filters by publication date (PD) per TED help
-# - Builds official notice URLs from publication number
-#
-# Env:
-#   EUFT_SINCE_DAYS (default 60)
-#   EUFT_MAX (default 40)
-#   EUFT_DEBUG (0/1)
-
-from __future__ import annotations
-from typing import List, Dict, Any
-from datetime import datetime, timedelta
-import os, json, html
+import os
+import logging
 import requests
+from datetime import datetime, timedelta, timezone
 
-API = "https://api.ted.europa.eu/v3/notices/search"
-UA  = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
-HEADERS = {"User-Agent": UA, "Content-Type": "application/json"}
+SESSION = requests.Session()
+SESSION.headers.update({"Content-Type": "application/json"})
 
-def _yyyymmdd(d: datetime) -> str:
-    return d.strftime("%Y%m%d")
+API_URL = "https://api.ted.europa.eu/v3/notices/search"
 
-def _env_int(name: str, default: int) -> int:
+# small, *supported* field set per docs
+TED_FIELDS = [
+    "publication-number",
+    "notice-title",
+    "buyer-name",
+    "place-of-performance",
+    "cpv",
+    "publication-date",
+    "notice-type",
+]
+
+def _to_iso(d: str) -> str | None:
+    # TED returns eForms publication date like 2024-02-13Z or 2024-02-13+01:00
     try:
-        return int(os.getenv(name, str(default)))
+        # normalize to date only
+        if d.endswith("Z"):
+            return datetime.fromisoformat(d.replace("Z", "+00:00")).date().isoformat()
+        return datetime.fromisoformat(d).date().isoformat()
     except Exception:
-        return default
+        return None
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip().lower() in ("1","true","yes")
-
-def _pick(d: Dict[str, Any], *keys):
-    for k in keys:
-        if k in d and d[k]:
-            return d[k]
+def _map_topic(title: str, desc: str = "") -> str | None:
+    text = f"{title} {desc}".lower()
+    topics = {
+        "Digital Governance": ["digital", "it ", "ict", "information system", "software", "data"],
+        "Fiscal Openness": ["audit", "budget", "tax", "revenue", "procure", "fiscal"],
+        "Open Government": ["open data", "transparency", "participation", "consultation", "citizen"],
+        "Access to Information": ["access to information", "ati", "foi"],
+        "Anti-Corruption": ["anti-corruption", "integrity", "fraud"],
+        "Civic Space": ["civil society", "ngo", "advocacy", "association"],
+        "Gender and Inclusion": ["gender", "women", "inclusion", "inclusive"],
+        "Justice": ["court", "judicial", "justice", "rule of law"],
+        "Media Freedom": ["media", "journalism", "press"],
+        "Climate and Environment": ["climate", "environment", "waste", "renewable", "biodiversity"],
+        "Public Participation": ["participation", "consult", "co-creation", "co creation"],
+    }
+    for label, kws in topics.items():
+        if any(k in text for k in kws):
+            return label
     return None
 
-def _eu_fetch(days_back: int = 60, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    debug = _env_bool("EUFT_DEBUG", False)
-    since = datetime.utcnow().date() - timedelta(days=days_back)
-    # TED "expert query" — PD is an alias of publication-date
-    # docs confirm PD / publication-date are valid equivalents.  (see citations)
-    query = f"PD>={_yyyymmdd(datetime(since.year, since.month, since.day))}"
+def _normalize_item(it):
+    pubno = it.get("publication-number")
+    url = f"https://ted.europa.eu/en/notice/-/detail/{pubno}" if pubno else None
+    title = it.get("notice-title") or f"TED Notice {pubno}"
+    pub_date = _to_iso(it.get("publication-date") or "")
+    # TED Search API doesn’t expose a unified “submission deadline” field across all forms.
+    # Leave deadline None; your Slack formatter already handles N/A.
+    country = None
+    pop = it.get("place-of-performance")
+    if isinstance(pop, dict):
+        country = pop.get("country") or pop.get("nuts")  # best-effort
+    topic = _map_topic(title)
+    return {
+        "source": "EU (TED)",
+        "country": country,
+        "title": title,
+        "url": url,
+        "published": pub_date,
+        "deadline": None,
+        "topic": topic,
+    }
 
-    out: List[Dict[str, Any]] = []
-    page = 1
-    limit = min(_env_int("EUFT_MAX", 40), 250)  # TED per-page hard cap is 250
+def _search_active(page=1, limit=50, query: str | None = None):
+    payload = {
+        # Per docs: page-number pagination and ACTIVE scope. query can be omitted.
+        "fields": TED_FIELDS,
+        "page": page,
+        "limit": limit,
+        "scope": "ACTIVE",
+        "checkQuerySyntax": False,
+        "paginationMode": "PAGE_NUMBER",
+    }
+    if query:
+        payload["query"] = query
+    r = SESSION.post(API_URL, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    while True:
-        body = {
-            "query": query,
-            # omit "fields" entirely to avoid 400 with unsupported names
-            "page": page,
-            "limit": limit,
-            "paginationMode": "PAGE_NUMBER",
-            "checkQuerySyntax": False,
-        }
-        try:
-            r = requests.post(API, headers=HEADERS, data=json.dumps(body), timeout=45)
-            r.raise_for_status()
-            data = r.json() or {}
-        except Exception as e:
-            if debug:
-                print(f"[eu_ft] WARN request failed page={page}: {e}")
-            break
-
-        results = data.get("results") or data.get("items") or []
+def fetch(ogp_only: bool = True, since_days: int | None = None) -> list[dict]:
+    """
+    Return normalized items from TED (EU). We keep the query broad (ACTIVE scope),
+    then filter client-side by publication date + (optional) topic mapping.
+    """
+    debug = os.getenv("EUFT_DEBUG")
+    try:
+        out: list[dict] = []
+        # Broad first page
+        data = _search_active(page=1, limit=50)
+        items = data.get("items") or []
         if debug:
             total = data.get("total")
-            print(f"[eu_ft] page={page} got={len(results)} total={total}")
+            logging.info(f"[eu_ft] total={total} returned={len(items)}")
 
-        if not results:
-            break
-
-        for row in results:
-            # The key names vary; try several common variants
-            pub_no = (
-                _pick(row, "publication-number", "publicationNumber", "publication_number")
-                or ""
-            ).strip()
-            title = (
-                _pick(row, "notice-title", "title", "ND-Title") or "EU opportunity"
-            ).strip()
-
-            # If no publication number, we can’t build the official URL — skip
-            if not pub_no:
+        for it in items:
+            norm = _normalize_item(it)
+            if not norm["title"] or not norm["url"]:
                 continue
 
-            # Official notice URL pattern per TED help:
-            # https://ted.europa.eu/{lang}/notice/-/detail/{publication-number}
-            url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
+            # date window filter (client-side)
+            if since_days:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat()
+                if norm["published"] and norm["published"] < cutoff:
+                    continue
 
-            out.append({
-                "title": html.unescape(title),
-                "source": "EU TED",
-                "deadline": None,          # can be added later if we request more fields
-                "country": "",
-                "topic": None,
-                "url": url,
-                "summary": f"{title} {pub_no}".lower(),
-            })
+            if ogp_only and not norm["topic"]:
+                # skip non-OGP-ish items if requested
+                continue
 
-        # Stop after first page: we only need fresh items
-        break
+            out.append(norm)
 
-    # Light OGP filtering only if your filters.py is present (never zero-out)
-    if ogp_only:
-        try:
-            from filters import ogp_relevant, is_excluded
-            preferred = [it for it in out if ogp_relevant(f"{it['title']} {it.get('summary','')}")]
-            out = preferred or out
-            out = [it for it in out if not is_excluded(f"{it['title']} {it.get('summary','')}")]
-        except Exception:
-            pass
+        # If we somehow got nothing (API changes or query optionality), fall back to a safe, valid example query
+        # from the docs (Luxembourg place of performance), just to avoid returning empty results.
+        if not out:
+            if debug:
+                logging.warning("[eu_ft] first attempt empty; falling back to LUX query")
+            data2 = _search_active(page=1, limit=50, query="place-of-performance IN (LUX)")
+            for it in data2.get("items") or []:
+                norm = _normalize_item(it)
+                if since_days:
+                    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).date().isoformat()
+                    if norm["published"] and norm["published"] < cutoff:
+                        continue
+                if ogp_only and not norm["topic"]:
+                    continue
+                out.append(norm)
 
-    return out
-
-class Connector:
-    def fetch(self, days_back: int = 60):
-        return _eu_fetch(days_back=days_back, ogp_only=True)
-
-def fetch(ogp_only: bool = True, since_days: int = 60, **kwargs):
-    return _eu_fetch(days_back=since_days, ogp_only=ogp_only)
-
-def accepted_args():
-    return ["ogp_only", "since_days"]
+        return out
+    except requests.HTTPError as e:
+        logging.warning(f"[eu_ft] HTTP {e.response.status_code}: {e} | body={e.response.text[:200] if e.response is not None else ''}")
+        return []
+    except Exception as e:
+        logging.warning(f"[eu_ft] failed: {e}")
+        return []
