@@ -1,172 +1,81 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-import hashlib, logging, requests
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
-from dateutil import parser as dateparser
+from typing import List, Dict, Any
+import re, html
+import requests
+from bs4 import BeautifulSoup
+import dateparser
 
-LOG = logging.getLogger(__name__)
-API = "https://api.ted.europa.eu/v3/notices/search"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; anansi/1.0)"}
+URL = "https://international-partnerships.ec.europa.eu/funding/funding-opportunities_en"
 
-KEYWORDS = [
-    "open government","governance","transparency","accountability","anti-corruption",
-    "civic","participation","open data","digital government","rule of law","justice",
-    "public finance","budget","procurement","PFM","access to information",
-    "civil society","media freedom","democracy"
-]
+def _to_iso(d: str | None) -> str | None:
+    if not d:
+        return None
+    dt = dateparser.parse(
+        d,
+        settings={"DATE_ORDER": "DMY", "PREFER_DAY_OF_MONTH": "first"},
+        languages=["en","fr","es","de","it"]
+    )
+    return dt.date().isoformat() if dt else None
 
-@dataclass
-class Opportunity:
-    id: str; title: str; donor: str; url: str
-    deadline: Optional[str]; published_date: Optional[str]; status: Optional[str]
-    tags: List[str]; country_scope: Optional[str]
-    amount: Optional[str]=None; currency: Optional[str]=None
-    def to_dict(self)->Dict: return asdict(self)
-
-def _hash(*parts: str) -> str:
-    return "eu_" + hashlib.sha1("::".join([p for p in parts if p]).encode()).hexdigest()[:16]
-
-def _classify(text: str) -> List[str]:
-    t=(text or "").lower(); tags=set()
-    if any(k in t for k in ["digital","data","ai","ict","open data","e-government"]): tags.add("ai_digital")
-    if any(k in t for k in ["budget","public finance","pfm"]): tags.add("budget")
-    if any(k in t for k in ["transparen","accountab","anti-corruption","integrity","procurement"]): tags.add("anti_corruption")
-    if any(k in t for k in ["civic","participation","citizen","civil society","media"]): tags.add("civic_participation")
-    if any(k in t for k in ["justice","rule of law","democracy"]): tags.add("justice")
-    if not tags: tags.add("governance")
-    return sorted(tags)
-
-def _call(body: Dict) -> Dict:
-    r = requests.post(API, json=body, timeout=30, headers={"Accept": "application/json"})
+def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
+    r = requests.get(URL, headers=HEADERS, timeout=45)
     r.raise_for_status()
-    return r.json()
+    soup = BeautifulSoup(r.text, "lxml")
 
-def _fetch_raw(page: int, page_size: int) -> List[Dict]:
-    body = {
-        "query": '(notice-title ~ ("*"))',         # minimal, always-valid
-        "fields": ["publication-number", "notice-title", "publication-date"],
-        "page": page,
-        "limit": page_size,
-        "scope": "ACTIVE",                         # currently valid notices
-        "checkQuerySyntax": False,
-        "paginationMode": "PAGE_NUMBER",
-    }
-    data = _call(body)
-    return data.get("results") or data.get("items") or []
+    out: List[Dict[str, Any]] = []
+    cards = soup.select("article, .card, .listing__item, li")
 
-def fetch(max_items: int = 50, since_days: Optional[int] = 120, ogp_only: bool = True) -> List[Dict]:
-    out: List[Opportunity] = []
-    page, page_size = 1, min(50, max_items)
-    today = datetime.now(timezone.utc).date()
-    fetched_raw = 0
+    for card in cards:
+        a = card.select_one("a[href]")
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        if not title:
+            continue
+        href = a.get("href", "")
+        url = href if href.startswith("http") else f"https://international-partnerships.ec.europa.eu{href}"
 
-    while len(out) < max_items:
-        try:
-            batch = _fetch_raw(page, page_size)
-        except requests.HTTPError as e:
-            LOG.warning("EU (TED) failed: %s", e)
-            break
-        if not batch: break
-        fetched_raw += len(batch)
+        blob = card.get_text(" ", strip=True)
+        # Extract a deadline if present
+        deadline = None
+        m = re.search(r"(deadline|closing|closes on)\s*[:\-]?\s*(.+?)($|\s{2,}|\. )", blob, flags=re.I)
+        if m:
+            deadline = _to_iso(m.group(2))
 
-        for it in batch:
-            pubnum = it.get("publication-number") or it.get("publicationNumber")
-            title = (it.get("notice-title") or it.get("noticeTitle") or "").strip()
-            pub = it.get("publication-date") or it.get("publicationDate")
-            if pub:
-                try:
-                    pub_dt = dateparser.parse(pub).date()
-                    pub_iso = pub_dt.isoformat()
-                except Exception:
-                    pub_dt = None
-                    pub_iso = None
-            else:
-                pub_dt = None
-                pub_iso = None
+        country = ""
+        tag = card.select_one(".ecl-tag, .tag, .badge")
+        if tag:
+            country = tag.get_text(" ", strip=True)
 
-            # client-side since_days
-            if since_days and pub_dt:
-                if pub_dt < (today - timedelta(days=since_days)):
-                    continue
+        out.append({
+            "title": html.unescape(title),
+            "source": "EU F&T (INTPA)",
+            "deadline": deadline,
+            "country": country,
+            "topic": None,
+            "url": url,
+            "summary": blob.lower(),
+        })
 
-            # client-side OGP title filter
-            if ogp_only and title:
-                low = title.lower()
-                if not any(k in low for k in [k.lower() for k in KEYWORDS]):
-                    continue
-
-            url = f"https://ted.europa.eu/en/notice/-/detail/{pubnum}" if pubnum else ""
-            out.append(Opportunity(
-                id=_hash(title, url or (pubnum or "")),
-                title=title,
-                donor="EU (TED)",
-                url=url,
-                deadline=None,                   # TED search rarely exposes deadline
-                published_date=pub_iso,
-                status="open",                   # ACTIVE scope
-                tags=_classify(title),
-                country_scope=None,
-            ))
-            if len(out) >= max_items: break
-
-        if len(batch) < page_size: break
-        page += 1
-
-    LOG.info("EU (TED): raw=%s, after_filters=%s (since_days=%s, ogp_only=%s)", fetched_raw, len(out), since_days, ogp_only)
-
-    # If nothing survived the title keyword filter, try once without it.
-    if not out and ogp_only:
-        LOG.info("EU (TED): 0 after OGP filter — retrying without ogp_only")
-        return fetch(max_items=max_items, since_days=since_days, ogp_only=False)
-
-    return [o.to_dict() for o in out]
-class Connector:
-    name = "eu"
-    def __init__(self, **kw): self.kwargs = kw
-    def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
-
-# ---- Back-compat procedural API (for existing aggregator) ----
-def _fetch_backcompat(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    items = Connector().fetch(days_back=since_days)
+    # Optional: OGP filter/exclude to mirror others
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            filtered = []
-            for it in items:
-                text = f"{it.get('title','')} {it.get('summary','')}"
-                if ogp_relevant(text) and not is_excluded(text):
-                    filtered.append(it)
-            items = filtered
+            out = [it for it in out
+                   if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
+                   and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
-    return items
 
-
-# ---------------- EU F&T connector: non-recursive wiring ----------------
-def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True):
-    """
-    Call the actual EU F&T scraping/API logic here.
-    Return a list of dicts with keys: title, source, deadline, country, topic, url, summary
-    """
-    # EXAMPLE stub:
-    # items = _scrape_eu_ft(days_back=days_back)
-    # if ogp_only:
-    #     from filters import ogp_relevant, is_excluded
-    #     items = [it for it in items
-    #              if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
-    #              and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
-    # return items
-    raise NotImplementedError("Hook up _euft_fetch_impl to your EU F&T logic.")
+    return out
 
 class Connector:
     def fetch(self, days_back: int = 90):
-        # DO NOT call fetch() here.
         return _euft_fetch_impl(days_back=days_back, ogp_only=True)
 
 # ---- Back-compat procedural API (for existing aggregator) ----
 def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    # DO NOT call Connector().fetch() here.
     return _euft_fetch_impl(days_back=since_days, ogp_only=ogp_only)
 
 def accepted_args():
