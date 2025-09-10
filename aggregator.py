@@ -8,6 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 
+CONNECTOR_PATHS = [
+    "connectors.world_bank",
+    "connectors.undp",
+    "connectors.afdb",
+    "connectors.afd",
+    "connectors.eu_intpa",
+]
+
 # --------- Connectors (import with graceful fallbacks) ----------------------
 EU_NAME = "EU"
 try:
