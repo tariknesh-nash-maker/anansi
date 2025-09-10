@@ -2,8 +2,9 @@
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
-import os, json, html, logging
-import requests
+import os, json, html, logging, requests
+
+from utils.debug_utils import is_on, dump_json, dump_text, kv
 
 API_URL = "https://api.ted.europa.eu/v3/notices/search"
 UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
@@ -19,12 +20,7 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip().lower() in ("1","true","yes")
-
-def _build_default_query(days_back: int) -> str:
-    # safest broad window by publication date; runner can override via EUFT_QUERY
+def _build_query(days_back: int) -> str:
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days_back)
     return f"publication-date>={_yyyymmdd(datetime(cutoff.year, cutoff.month, cutoff.day))}"
 
@@ -52,54 +48,65 @@ def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
         "summary": title.lower(),
     }
 
-def _post(query: str, page: int, limit: int, debug: bool) -> List[Dict[str, Any]]:
+def _post(query: str, page: int, limit: int, debug: bool) -> list[dict]:
     payload = {
-        "query": query,  # must not be empty
+        "query": query,  # MUST NOT be empty
         "page": page,
         "limit": limit,
         "paginationMode": "PAGE_NUMBER",
         "checkQuerySyntax": False,
     }
+    if debug:
+        kv("eu_ft:req", query=query, page=page, limit=limit)
+        dump_json("euft-payload", payload)
     r = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
+    if debug:
+        dump_text("euft-response", r.text[:2000])
+        kv("eu_ft:http", status=r.status_code, bytes=len(r.text or ""))
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
         if debug:
-            logging.warning(f"[eu_ft] HTTP {r.status_code} for query='{query}' body={r.text[:280]}")
+            logging.warning(f"[eu_ft] HTTP {r.status_code}: {e} body={r.text[:300]}")
         return []
     data = r.json() or {}
     rows = data.get("results") or data.get("items") or []
     if debug:
-        logging.info(f"[eu_ft] query='{query}' got={len(rows)} total={data.get('total')}")
+        kv("eu_ft:parsed", rows=len(rows), total=data.get("total"))
+        dump_json("euft-json", data)
     return rows
 
+def _apply_soft_ogp(items: List[Dict[str, Any]], debug: bool) -> List[Dict[str, Any]]:
+    raw = len(items)
+    preferred = [it for it in items if it.get("topic")]
+    out = preferred or items
+    if debug:
+        kv("eu_ft:filter", raw=raw, ogp_kept=len(preferred), returned=len(out))
+    return out
+
 def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    debug = _env_bool("EUFT_DEBUG", False)
+    debug = is_on("EUFT_DEBUG", "DEBUG")
     limit = min(_env_int("EUFT_MAX", 40), 250)
     page = 1
 
-    # 1) primary query (env-overridable)
-    primary_q = os.getenv("EUFT_QUERY") or _build_default_query(days_back)
-    rows = _post(primary_q, page, limit, debug)
-    items = [n for r in rows if (n := _normalize(r))]
+    primary_q = os.getenv("EUFT_QUERY") or _build_query(days_back)
+    variants = [primary_q, primary_q.replace("publication-date", "PD"), "place-of-performance IN (LUX)"]
 
-    # 2) if empty, try two known-good variants (don’t fail silently)
-    if not items:
-        variants = [
-            primary_q.replace("publication-date", "PD"),
-            "place-of-performance IN (LUX)",  # narrow but known to return something
-        ]
-        for q in variants:
-            rows = _post(q, page, limit, debug)
-            candidates = [n for r in rows if (n := _normalize(r))]
-            if candidates:
-                items = candidates
-                break
+    items: List[Dict[str, Any]] = []
+    for q in variants:
+        rows = _post(q, page, limit, debug)
+        normed = [n for r in rows if (n := _normalize(r))]
+        if debug:
+            kv("eu_ft:norm", q=q, normed=len(normed))
+        if normed:
+            items = normed
+            break
 
-    # 3) soft OGP preference (never zero-out)
     if ogp_only and items:
-        preferred = [it for it in items if it.get("topic")]
-        items = preferred or items
+        items = _apply_soft_ogp(items, debug)
+
+    if debug and not items:
+        kv("eu_ft:empty", tried=len(variants), q0=variants[0], q1=variants[1], q2=variants[2])
 
     return items
 
