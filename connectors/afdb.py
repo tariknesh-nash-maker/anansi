@@ -105,9 +105,9 @@ def _fetch_backcompat(ogp_only: bool = True, since_days: int = 60, **kwargs):
 
 def fetch(ogp_only: bool = True, since_days: int = 60, **kwargs):
     items = Connector().fetch(days_back=since_days)
-    # AfDB pages are terse; don't over-filter here. Only drop obvious auctions if your helper exists.
     try:
         from filters import is_excluded
+        # Only drop obvious auction/sale junk — AfDB copy is sparse; keep it permissive
         items = [it for it in items if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
     except Exception:
         pass
