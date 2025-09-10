@@ -54,13 +54,13 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
     sess = _retry_session()
     items: List[Dict[str, Any]] = []
     offset = 0
-    rows = 100  # start conservative to avoid 500s on large payloads
-    max_offset = 3000
+    rows = 100
+    tried_fallback = False
 
     while True:
         params = {
             "format": "json",
-            "qterm": "",
+            "qterm": "",  # leave empty; filter after
             "fl": "id,notice,noticeid,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
             "os": offset,
             "rows": rows,
@@ -68,18 +68,18 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
         try:
             r = sess.get(BASE, params=params, headers=HEADERS, timeout=45)
             if r.status_code >= 500:
-                # let Retry handle; if still failing, drop rows size and retry once manually
                 if rows > 50:
                     rows = 50
-                    time.sleep(1.2)
+                    time.sleep(1.0)
                     continue
             r.raise_for_status()
             j = r.json()
         except Exception:
-            # final fallback: reduce page size once more
-            if rows > 25:
+            # one-shot ultra-conservative fallback page size
+            if not tried_fallback:
+                tried_fallback = True
                 rows = 25
-                time.sleep(1.2)
+                time.sleep(1.0)
                 continue
             break
 
@@ -96,11 +96,13 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
             deadline_iso = _to_iso(doc.get("submissiondeadline"))
             pub_iso = _to_iso(doc.get("publicationdate"))
 
-            keep = False
-            if deadline_iso and deadline_iso >= today_iso:
-                keep = True
-            if pub_iso and pub_iso >= since_date:
-                keep = True
+            # Be permissive: keep items even if both dates are missing
+            keep = True
+            # But if there is a date, apply the sensible checks
+            if deadline_iso:
+                keep = keep and (deadline_iso >= since_date)
+            if pub_iso:
+                keep = keep and (pub_iso >= since_date)
             if not keep:
                 continue
 
@@ -118,7 +120,7 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
         offset += rows
         if total and offset >= total:
             break
-        if offset >= max_offset:
+        if offset >= 2000:  # safety
             break
 
     if ogp_only:
