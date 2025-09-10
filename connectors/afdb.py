@@ -1,110 +1,85 @@
 # connectors/afdb.py
-# African Development Bank – Project-related Procurement RSS (GPN + SPN)
-# Feeds are public (Drupal views RSS). We parse the latest entries.
-#
-# Env:
-#   AFDB_MAX (default 40)
-#   AFDB_DEBUG (0/1)
-
-from __future__ import annotations
-from typing import List, Dict, Any
-import os, time
+import os
+import re
+import time
+import logging
+from datetime import datetime, timedelta, timezone
 import feedparser
-from datetime import datetime, timedelta
 
-# Confirmed RSS endpoints (project-related procurement)
+# Official AfDB RSS endpoints (Drupal views export as rss.xml)
 FEEDS = [
+    # Project-related procurement:
     "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml",
     "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml",
+    # Corporate procurement (Bank’s own tenders) – this one exposes multiple RSS paths; keep both forms:
+    "https://www.afdb.org/en/about-us/corporate-procurement?format=rss",
+    "https://www.afdb.org/en/corporate-procurement/news-and-events/rss",
 ]
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+DATE_RE = re.compile(r"(?:deadline|closing)\s*[:\-]?\s*(\d{1,2}\s+\w+\s+\d{4})", re.I)
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip().lower() in ("1","true","yes")
-
-def _to_iso_from_struct(tm) -> str | None:
+def _parse_deadline(text: str) -> str | None:
+    m = DATE_RE.search(text or "")
+    if not m:
+        return None
     try:
-        return datetime(*tm[:6]).date().isoformat()
+        dt = datetime.strptime(m.group(1), "%d %B %Y").date().isoformat()
+        return dt
     except Exception:
         return None
 
-def _fetch_feed(url: str, debug: bool = False):
-    if debug:
-        print(f"[afdb] GET {url}")
-    # feedparser handles redirects + gzip
-    return feedparser.parse(url)
+def _topic(title: str, summary: str = "") -> str | None:
+    s = f"{title} {summary}".lower()
+    if any(k in s for k in ["audit", "public finance", "budget", "tax"]):
+        return "Fiscal Openness"
+    if any(k in s for k in ["data", "digital", "ict", "information system", "software"]):
+        return "Digital Governance"
+    if any(k in s for k in ["open data", "transparency", "citizen", "participation"]):
+        return "Open Government"
+    return None
 
-def _afdb_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    debug = _env_bool("AFDB_DEBUG", False)
-    max_items = _env_int("AFDB_MAX", 40)
-    since = datetime.utcnow().date() - timedelta(days=days_back)
+def fetch(ogp_only: bool = True, since_days: int | None = None) -> list[dict]:
+    debug = os.getenv("AFDB_DEBUG")
+    cutoff_date = None
+    if since_days:
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=since_days)).date()
 
-    items: List[Dict[str, Any]] = []
+    out: list[dict] = []
     for url in FEEDS:
         try:
-            fp = _fetch_feed(url, debug=debug)
-        except Exception as e:
+            feed = feedparser.parse(url)
             if debug:
-                print(f"[afdb] WARN feed error: {e}")
-            continue
-        for e in fp.entries[: max_items * 2]:
-            title = (getattr(e, "title", "") or "").strip()
-            link  = (getattr(e, "link", "") or "").strip()
-            if not title or not link:
-                continue
+                logging.info(f"[afdb] feed={url} status={getattr(feed, 'status', '?')} entries={len(feed.entries)}")
 
-            # Use published/updated if provided
-            pub_iso = None
-            if getattr(e, "published_parsed", None):
-                pub_iso = _to_iso_from_struct(e.published_parsed)
-            elif getattr(e, "updated_parsed", None):
-                pub_iso = _to_iso_from_struct(e.updated_parsed)
+            for e in feed.entries:
+                title = (e.title or "").strip()
+                link = e.link
+                summary = getattr(e, "summary", "") or getattr(e, "description", "")
+                # pick published date if available
+                pub_dt = None
+                if getattr(e, "published_parsed", None):
+                    pub_dt = datetime.fromtimestamp(time.mktime(e.published_parsed), tz=timezone.utc).date()
+                elif getattr(e, "updated_parsed", None):
+                    pub_dt = datetime.fromtimestamp(time.mktime(e.updated_parsed), tz=timezone.utc).date()
 
-            # Keep recent items if we have a date; if not, keep anyway (permissive)
-            keep = True
-            if pub_iso:
-                keep = pub_iso >= since.isoformat()
-            if not keep:
-                continue
+                if cutoff_date and pub_dt and pub_dt < cutoff_date:
+                    continue
 
-            items.append({
-                "title": title,
-                "source": "AfDB",
-                "deadline": None,            # not present in the feed
-                "country": "",
-                "topic": None,
-                "url": link,
-                "summary": (getattr(e, "summary", "") or title).lower(),
-            })
-            if len(items) >= max_items:
-                break
-        if len(items) >= max_items:
-            break
+                deadline = _parse_deadline(summary)
+                topic = _topic(title, summary) if ogp_only else None
+                if ogp_only and not topic:
+                    continue
 
-    # Optional OGP/exclusion pass; never zero-out
-    if ogp_only:
-        try:
-            from filters import ogp_relevant, is_excluded
-            preferred = [it for it in items if ogp_relevant(f"{it['title']} {it.get('summary','')}")]
-            items = preferred or items
-            items = [it for it in items if not is_excluded(f"{it['title']} {it.get('summary','')}")]
-        except Exception:
-            pass
+                out.append({
+                    "source": "AfDB",
+                    "country": None,  # country is often in the body, not consistently in the feed
+                    "title": title,
+                    "url": link,
+                    "published": pub_dt.isoformat() if pub_dt else None,
+                    "deadline": deadline,
+                    "topic": topic,
+                })
+        except Exception as e:
+            logging.warning(f"[afdb] feed failed url={url}: {e}")
 
-    return items
-
-class Connector:
-    def fetch(self, days_back: int = 90):
-        return _afdb_fetch(days_back=days_back, ogp_only=True)
-
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    return _afdb_fetch(days_back=since_days, ogp_only=ogp_only)
-
-def accepted_args():
-    return ["ogp_only", "since_days"]
+    return out
