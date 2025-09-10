@@ -1,4 +1,3 @@
-# anansi/connectors/world_bank.py
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
@@ -16,32 +15,52 @@ def _to_iso(s: str | None) -> str | None:
     dt = dateparser.parse(s, settings={"DATE_ORDER": "DMY", "PREFER_DAY_OF_MONTH": "first"})
     return dt.date().isoformat() if dt else None
 
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip() in ("1","true","True","YES","yes")
+
 def _rows_cap(default:int, env_name:str, max_allowed:int=200) -> int:
     try:
         v = int(os.getenv(env_name, str(default)))
     except Exception:
         v = default
-    return max(1, min(v, max_allowed))  # WB API chokes on very large rows
+    return max(1, min(v, max_allowed))
 
-def _pages_cap(default:int, env_name:str, hard_cap:int=10) -> int:
-    try:
-        v = int(os.getenv(env_name, str(default)))
-    except Exception:
-        v = default
-    return max(1, min(v, hard_cap))
+def _safe_docs(j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(j.get("documents"), dict):
+        return list(j["documents"].values())
+    for k in ("documents","rows","items"):
+        if isinstance(j.get(k), list):
+            return j[k]
+    if isinstance(j.get("hits"), dict):
+        return list(j["hits"].values())
+    return []
 
 def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
     """
     Robust pull from the classic WB consultants endpoint.
-    We avoid strict pre-filters that can zero out results.
-    Env knobs (optional):
+    Never zero-out results because of missing fields; let downstream filters work.
+    Controlled by env:
       WB_ROWS (<=200), WB_PAGES (<=10), WB_MAX_RESULTS, WB_PUB_WINDOW_DAYS
+      WB_QTERM (free text), WB_REQUIRE_TOPIC_MATCH (0/1), WB_TOPIC_LIST (pipe-separated)
     """
     since_iso = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
-    rows = _rows_cap(default=100, env_name="WB_ROWS", max_allowed=200)
-    pages = _pages_cap(default=8, env_name="WB_PAGES", hard_cap=10)
-    max_results = int(os.getenv("WB_MAX_RESULTS", "500"))
-    pub_window_days = int(os.getenv("WB_PUB_WINDOW_DAYS", str(days_back)))
+    rows        = _rows_cap( min(100, _int("WB_ROWS", 100)), "WB_ROWS", 200)
+    pages       = max(1, min(_int("WB_PAGES", 8), 10))
+    max_results = _int("WB_MAX_RESULTS", 500)
+    pub_window  = _int("WB_PUB_WINDOW_DAYS", days_back)
+    qterm       = os.getenv("WB_QTERM", "")
+    require_topic_match = _bool("WB_REQUIRE_TOPIC_MATCH", False)
+    topic_raw   = os.getenv("WB_TOPIC_LIST", "")
+    topic_list  = [t.strip().lower() for t in topic_raw.split("|") if t.strip()]
 
     out: List[Dict[str, Any]] = []
     offset = 0
@@ -49,9 +68,7 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
     for _ in range(pages):
         params = {
             "format": "json",
-            # empty qterm returns the catalogue; we filter client-side
-            "qterm": os.getenv("WB_QTERM", ""),
-            # ask for the specific fields we need
+            "qterm": qterm,  # can be empty
             "fl": "id,notice,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
             "os": offset,
             "rows": rows,
@@ -60,27 +77,15 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
             r = requests.get(BASE, params=params, headers=HEADERS, timeout=45)
             if r.status_code >= 500:
                 time.sleep(1.0)
-                # try once more with a smaller page if needed
                 if rows > 50:
                     rows = 50
                     continue
             r.raise_for_status()
             j = r.json()
         except Exception:
-            # stop this connector gracefully on repeated errors
             break
 
-        docs = []
-        # API can return {"documents": {...}} or lists – normalize
-        if isinstance(j.get("documents"), dict):
-            docs = list(j["documents"].values())
-        elif isinstance(j.get("documents"), list):
-            docs = j["documents"]
-        elif isinstance(j.get("rows"), list):
-            docs = j["rows"]
-        elif isinstance(j.get("hits"), dict):
-            docs = list(j["hits"].values())
-
+        docs = _safe_docs(j)
         if not docs:
             break
 
@@ -93,38 +98,41 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
             deadline = _to_iso(d.get("submissiondeadline"))
             pubdate = _to_iso(d.get("publicationdate"))
 
-            # gentle time window: keep item if it's recent by pubdate OR has any deadline
-            keep = True
-            if pub_window_days and pubdate:
-                keep = pubdate >= (datetime.utcnow().date() - timedelta(days=pub_window_days)).isoformat()
-            # if no dates at all, keep (we don't want false negatives)
-            if not keep:
+            # Time window is gentle: if pubdate exists, keep only if recent; otherwise keep.
+            if pub_window and pubdate and pubdate < (datetime.utcnow().date() - timedelta(days=pub_window)).isoformat():
                 continue
 
-            out.append({
+            summary = f"{title} {country} pub:{pubdate or ''}".lower()
+            item = {
                 "title": title,
                 "source": "World Bank",
-                "deadline": deadline,  # may be None
+                "deadline": deadline,   # may be None
                 "country": country,
-                "topic": None,         # your normalizer/filters assign topic later
+                "topic": None,
                 "url": url,
-                "summary": f"{title} {country} pub:{pubdate or ''}".lower(),
-            })
+                "summary": summary,
+            }
 
+            # Optional topic gate (but only if a non-empty topic list is configured)
+            if require_topic_match and topic_list:
+                text = f"{title} {summary}".lower()
+                if not any(t in text for t in topic_list):
+                    # skip only if an explicit topic list was provided
+                    continue
+
+            out.append(item)
             if len(out) >= max_results:
                 break
+
         if len(out) >= max_results:
             break
-
         offset += rows
 
-    # Optional OGP filtering (shared filters.py)
+    # Optional OGP keywords / excludes (multilingual) — keep light to avoid zeros
     if ogp_only:
         try:
-            from filters import ogp_relevant, is_excluded
-            out = [it for it in out
-                   if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
-                   and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+            from filters import is_excluded
+            out = [it for it in out if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
 
