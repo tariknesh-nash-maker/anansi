@@ -18,13 +18,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run aggregator (WB + UNDP)
+      - name: Run aggregator 
         run: python aggregator.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
           # ---------- World Bank (Finances One connector) ----------
           WB_DEBUG: "1"
+          DEBUG_DUMP_DIR: "_debug"
+          EUFT_DEBUG: "1"     # optional; we still force logs on 0
+          AFDB_DEBUG: "1"     # optional; we still force logs on 0
+          
           WB_ROWS: "800"               # scan 800 rows per page
           WB_PAGES: "10"               # scan 8,000 newest rows
           WB_PUB_WINDOW_DAYS: "180"    # widen while validating; reduce to 90 later
@@ -42,6 +46,13 @@ jobs:
           UNDP_TOPIC_LIST: "Access to Information|Anti-Corruption|Civic Space|Climate and Environment|Digital Governance|Fiscal Openness|Gender and Inclusion|Justice|Media Freedom|Public Participation"
           UNDP_QTERM: ""               # optional extra filter (pipe-separated): e.g., "rfp|eoi|open data|beneficial ownership"
 
+      - name: Upload debug dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-dumps
+          path: _debug
+      
       - name: Persist state
         run: |
           git config user.email "bot@users.noreply.github.com"
