@@ -1,4 +1,3 @@
-# utils/debug_utils.py
 from __future__ import annotations
 import os, json, time, pathlib, typing as T
 
@@ -39,5 +38,5 @@ def dump_text(name: str, text: str) -> None:
         pass
 
 def kv(prefix: str, **kwargs):
-    kvs = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+    kvs = " ".join(f"{k}={repr(v)}" for k, v in kwargs.items())
     print(f"[{prefix}] {kvs}")
