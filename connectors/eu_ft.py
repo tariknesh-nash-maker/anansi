@@ -127,26 +127,24 @@ class Connector:
     def fetch(self, **kw)->List[Dict]: return fetch(**{**self.kwargs, **kw})
 
 # ---- Back-compat procedural API (for existing aggregator) ----
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    """
-    Backwards-compatible wrapper so old aggregator imports work:
-      from connectors.X import fetch as fetch_X
-    """
+def _fetch_backcompat(ogp_only: bool = True, since_days: int = 90, **kwargs):
     items = Connector().fetch(days_back=since_days)
     if ogp_only:
         try:
-            from filters import ogp_relevant
-            filt = []
+            from filters import ogp_relevant, is_excluded
+            filtered = []
             for it in items:
                 text = f"{it.get('title','')} {it.get('summary','')}"
-                if ogp_relevant(text):
-                    filt.append(it)
-            items = filt
+                if ogp_relevant(text) and not is_excluded(text):
+                    filtered.append(it)
+            items = filtered
         except Exception:
-            # If filters module not present, just return items
             pass
     return items
 
+def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+    # IMPORTANT: call the helper, not fetch() itself (prevents recursion)
+    return _fetch_backcompat(ogp_only=ogp_only, since_days=since_days, **kwargs)
+
 def accepted_args():
-    # Preserve your logging of accepted args
     return ["ogp_only", "since_days"]
