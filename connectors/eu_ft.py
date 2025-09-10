@@ -48,44 +48,39 @@ def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
         "summary": title.lower(),
     }
 
-def _post(query: str, page: int, limit: int, debug: bool) -> list[dict]:
+def _post(query: str, page: int, limit: int, verbose: bool) -> list[dict]:
     payload = {
-        "query": query,  # MUST NOT be empty
+        "query": query,  # REQUIRED
         "page": page,
         "limit": limit,
         "paginationMode": "PAGE_NUMBER",
         "checkQuerySyntax": False,
     }
-    if debug:
-        kv("eu_ft:req", query=query, page=page, limit=limit)
-        dump_json("euft-payload", payload)
     r = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
-    if debug:
-        dump_text("euft-response", r.text[:2000])
-        kv("eu_ft:http", status=r.status_code, bytes=len(r.text or ""))
+    if verbose:
+        kv("eu_ft:req", query=query, page=page, limit=limit, http=r.status_code, bytes=len(r.text or ""))
+        dump_json("euft-payload", payload)
+        dump_text("euft-response", r.text[:4000])
     try:
         r.raise_for_status()
     except requests.HTTPError as e:
-        if debug:
-            logging.warning(f"[eu_ft] HTTP {r.status_code}: {e} body={r.text[:300]}")
+        print(f"[eu_ft] HTTP {r.status_code}: {e} body={r.text[:300]}")
         return []
-    data = r.json() or {}
+    data = {}
+    try:
+        data = r.json() or {}
+    except Exception:
+        if verbose:
+            print("[eu_ft] WARN: response not JSON-decodable")
     rows = data.get("results") or data.get("items") or []
-    if debug:
+    if verbose:
         kv("eu_ft:parsed", rows=len(rows), total=data.get("total"))
         dump_json("euft-json", data)
     return rows
 
-def _apply_soft_ogp(items: List[Dict[str, Any]], debug: bool) -> List[Dict[str, Any]]:
-    raw = len(items)
-    preferred = [it for it in items if it.get("topic")]
-    out = preferred or items
-    if debug:
-        kv("eu_ft:filter", raw=raw, ogp_kept=len(preferred), returned=len(out))
-    return out
-
 def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    debug = is_on("EUFT_DEBUG", "DEBUG")
+    # Turn on verbose if env says so OR if we end up with zero results
+    env_verbose = is_on("EUFT_DEBUG", "DEBUG")
     limit = min(_env_int("EUFT_MAX", 40), 250)
     page = 1
 
@@ -93,20 +88,29 @@ def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]
     variants = [primary_q, primary_q.replace("publication-date", "PD"), "place-of-performance IN (LUX)"]
 
     items: List[Dict[str, Any]] = []
-    for q in variants:
-        rows = _post(q, page, limit, debug)
+    last_rows = 0
+    for idx, q in enumerate(variants):
+        rows = _post(q, page, limit, verbose=env_verbose)
+        last_rows = len(rows)
         normed = [n for r in rows if (n := _normalize(r))]
-        if debug:
-            kv("eu_ft:norm", q=q, normed=len(normed))
+        if env_verbose:
+            kv("eu_ft:norm", variant=idx, normed=len(normed))
         if normed:
             items = normed
             break
 
-    if ogp_only and items:
-        items = _apply_soft_ogp(items, debug)
+    # If still zero, force verbose one more time so logs show up even without env flags
+    if not items and not env_verbose:
+        kv("eu_ft:empty", tried=len(variants), last_rows=last_rows, forcing_verbose=True)
+        # re-run the first variant just to print diagnostics
+        _post(variants[0], page, limit, verbose=True)
 
-    if debug and not items:
-        kv("eu_ft:empty", tried=len(variants), q0=variants[0], q1=variants[1], q2=variants[2])
+    # Soft OGP preference (don’t zero-out)
+    if ogp_only and items:
+        preferred = [it for it in items if it.get("topic")]
+        if env_verbose:
+            kv("eu_ft:ogp", raw=len(items), preferred=len(preferred))
+        items = preferred or items
 
     return items
 
