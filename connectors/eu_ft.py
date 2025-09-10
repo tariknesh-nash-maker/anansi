@@ -1,8 +1,4 @@
 # connectors/eu_ft.py
-# EU: Tenders Electronic Daily (TED) Search API v3
-# - Always sends a non-empty expert query (publication-date>=YYYYMMDD)
-# - Minimal payload (no brittle 'fields' that 400)
-# - SOFT OGP gating (prefer matches, never zero-out)
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
@@ -27,18 +23,17 @@ def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     return default if v is None else str(v).strip().lower() in ("1","true","yes")
 
-def _build_query(days_back: int) -> str:
+def _build_default_query(days_back: int) -> str:
+    # safest broad window by publication date; runner can override via EUFT_QUERY
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days_back)
     return f"publication-date>={_yyyymmdd(datetime(cutoff.year, cutoff.month, cutoff.day))}"
 
-def _normalize_item(row: Dict[str, Any]) -> Dict[str, Any] | None:
-    # Use common variants defensively—API field names can differ
+def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
     pub_no = (row.get("publication-number") or row.get("publicationNumber") or row.get("publication_number") or "").strip()
     if not pub_no:
         return None
     title = (row.get("notice-title") or row.get("title") or f"TED Notice {pub_no}").strip()
     url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
-    # Soft topical hint for ogp_only preference
     text = title.lower()
     topic = None
     if any(k in text for k in ("digital", "data", "ict", "software", "information system")):
@@ -50,68 +45,61 @@ def _normalize_item(row: Dict[str, Any]) -> Dict[str, Any] | None:
     return {
         "title": html.unescape(title),
         "source": "EU TED",
-        "deadline": None,     # deadlines vary by form type—safe to leave None
+        "deadline": None,
         "country": "",
         "topic": topic,
         "url": url,
         "summary": title.lower(),
     }
 
-def _prefer_or_fallback(preferred: List[Dict[str, Any]], fallback: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return preferred if preferred else fallback
+def _post(query: str, page: int, limit: int, debug: bool) -> List[Dict[str, Any]]:
+    payload = {
+        "query": query,  # must not be empty
+        "page": page,
+        "limit": limit,
+        "paginationMode": "PAGE_NUMBER",
+        "checkQuerySyntax": False,
+    }
+    r = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        if debug:
+            logging.warning(f"[eu_ft] HTTP {r.status_code} for query='{query}' body={r.text[:280]}")
+        return []
+    data = r.json() or {}
+    rows = data.get("results") or data.get("items") or []
+    if debug:
+        logging.info(f"[eu_ft] query='{query}' got={len(rows)} total={data.get('total')}")
+    return rows
 
 def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
     debug = _env_bool("EUFT_DEBUG", False)
-    query = _build_query(days_back)
-    page = 1
     limit = min(_env_int("EUFT_MAX", 40), 250)
-    items: List[Dict[str, Any]] = []
+    page = 1
 
-    # Try a couple of query variants to avoid returning 0 if one alias changes server-side
-    query_variants = [
-        query,
-        query.replace("publication-date", "PD"),
-        f"PD=[{query.split('>=')[1]}..99991231]"
-    ]
+    # 1) primary query (env-overridable)
+    primary_q = os.getenv("EUFT_QUERY") or _build_default_query(days_back)
+    rows = _post(primary_q, page, limit, debug)
+    items = [n for r in rows if (n := _normalize(r))]
 
-    for q in query_variants:
-        payload = {
-            "query": q,  # REQUIRED (avoid 400)
-            "page": page,
-            "limit": limit,
-            "paginationMode": "PAGE_NUMBER",
-            "checkQuerySyntax": False,
-            # omit 'fields' and 'scope' to keep payload universally valid
-        }
-        try:
-            resp = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
-            resp.raise_for_status()
-            data = resp.json() or {}
-            rows = data.get("results") or data.get("items") or []
-            if debug:
-                total = data.get("total")
-                logging.info(f"[eu_ft] query='{q}' got={len(rows)} total={total}")
-        except requests.HTTPError as e:
-            if debug:
-                logging.warning(f"[eu_ft] HTTP {e.response.status_code}: {e} | body={e.response.text[:300] if e.response is not None else ''}")
-            rows = []
-        except Exception as e:
-            if debug:
-                logging.warning(f"[eu_ft] request failed for q='{q}': {e}")
-            rows = []
+    # 2) if empty, try two known-good variants (don’t fail silently)
+    if not items:
+        variants = [
+            primary_q.replace("publication-date", "PD"),
+            "place-of-performance IN (LUX)",  # narrow but known to return something
+        ]
+        for q in variants:
+            rows = _post(q, page, limit, debug)
+            candidates = [n for r in rows if (n := _normalize(r))]
+            if candidates:
+                items = candidates
+                break
 
-        normed = []
-        for r in rows:
-            n = _normalize_item(r)
-            if n: normed.append(n)
-
-        if normed:  # success path on first non-empty variant
-            if ogp_only:
-                preferred = [it for it in normed if it.get("topic")]
-                items = _prefer_or_fallback(preferred, normed)
-            else:
-                items = normed
-            break
+    # 3) soft OGP preference (never zero-out)
+    if ogp_only and items:
+        preferred = [it for it in items if it.get("topic")]
+        items = preferred or items
 
     return items
 
