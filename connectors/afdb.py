@@ -90,11 +90,7 @@ def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
             # If filters module not present, just return items
             pass
     return items
-
-def accepted_args():
-    # Preserve your logging of accepted args
-    return ["ogp_only", "since_days"]
-
+    
 def _fetch_backcompat(ogp_only: bool = True, since_days: int = 60, **kwargs):
     items = Connector().fetch(days_back=since_days)
     if ogp_only:
@@ -108,8 +104,14 @@ def _fetch_backcompat(ogp_only: bool = True, since_days: int = 60, **kwargs):
     return items
 
 def fetch(ogp_only: bool = True, since_days: int = 60, **kwargs):
-    return _fetch_backcompat(ogp_only=ogp_only, since_days=since_days, **kwargs)
+    items = Connector().fetch(days_back=since_days)
+    # AfDB pages are terse; don't over-filter here. Only drop obvious auctions if your helper exists.
+    try:
+        from filters import is_excluded
+        items = [it for it in items if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+    except Exception:
+        pass
+    return items
 
 def accepted_args():
     return ["ogp_only", "since_days"]
-
