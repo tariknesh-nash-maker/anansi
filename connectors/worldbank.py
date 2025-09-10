@@ -1,7 +1,8 @@
 # connectors/world_bank.py
-# Robust World Bank connector (classic consultants API) with soft filtering
-# - Compatible with function-style imports (`fetch(...)`) and class-style (`Connector().fetch(...)`)
-# - Respects your env knobs but NEVER zeros out results just because dates or topics are missing
+# World Bank procurement via Finances One (DS00979 / RS00909)
+# - Class + function APIs (back-compat with your aggregator)
+# - Uses stable datacatalog API with top/skip paging
+# - Soft filters: never zero out just because topics/dates are missing
 
 from __future__ import annotations
 from typing import List, Dict, Any
@@ -10,11 +11,13 @@ import os, time
 import requests
 import dateparser
 
-BASE = "https://search.worldbank.org/api/consultants"
+F1_BASE = "https://datacatalogapi.worldbank.org/dexapps/fone/api/apiservice"
+DATASET_ID = "DS00979"  # Procurement Notice
+RESOURCE_ID = "RS00909"
 UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
-HEADERS = {"User-Agent": UA}
+HEADERS = {"User-Agent": UA, "Accept": "application/json"}
 
-# --------------------- helpers ---------------------
+# ---------------- helpers ----------------
 
 def _to_iso(s: str | None) -> str | None:
     if not s:
@@ -30,171 +33,146 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes")
-
-def _rows_cap(default: int, env_name: str, max_allowed: int = 200) -> int:
-    try:
-        v = int(os.getenv(env_name, str(default)))
-    except Exception:
-        v = default
-    return max(1, min(v, max_allowed))  # WB API dislikes very large pages
-
-def _safe_docs(j: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # API returns various shapes; normalize to a list of dicts
-    if isinstance(j.get("documents"), dict):
-        return list(j["documents"].values())
-    for k in ("documents", "rows", "items"):
-        if isinstance(j.get(k), list):
-            return j[k]
-    if isinstance(j.get("hits"), dict):
-        return list(j["hits"].values())
-    return []
+    return default if v is None else str(v).strip().lower() in ("1","true","yes")
 
 def _prefer_or_fallback(preferred: List[Dict[str, Any]], fallback: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return preferred if preferred else fallback
 
-# --------------------- core impl ---------------------
+def _fetch_slice(top: int, skip: int, debug: bool = False):
+    # F1 returns {"count": <int>, "data": [ ... ]} always on success
+    url = f"{F1_BASE}?datasetId={DATASET_ID}&resourceId={RESOURCE_ID}&type=json&top={top}&skip={skip}"
+    if debug:
+        print(f"[worldbank:F1] GET {url}")
+    r = requests.get(url, headers=HEADERS, timeout=45)
+    r.raise_for_status()
+    return r.json() or {}
+
+# ---------------- core impl ----------------
 
 def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
     """
-    Pull from the classic WB consultants endpoint.
-    We are permissive with fields (dates often missing). We NEVER return 0 due to strict gates.
-    Env knobs (all optional):
-      WB_ROWS (<=200), WB_PAGES (<=10), WB_MAX_RESULTS (cap results)
-      WB_PUB_WINDOW_DAYS (default = days_back)
-      WB_QTERM (free-text; leave empty to avoid starving results)
-      WB_REQUIRE_TOPIC_MATCH (0/1), WB_TOPIC_LIST (pipe-separated)
-      WB_DEBUG (1 to print lightweight debug)
+    Pull the most recent procurement notices from Finances One.
+    Strategy:
+      1) probe count with a tiny call (top=1) to know total rows
+      2) read the newest 'slices' from the tail using skip = count - top
+      3) filter gently by publication/deadline recency (if present)
+    Env knobs (optional):
+      WB_MAX_RESULTS (default 60)  -> how many items to return total
+      WB_PAGES (default 1)         -> how many tail slices to fetch (each up to 1000)
+      WB_DEBUG (0/1)               -> extra prints
+      WB_REQUIRE_TOPIC_MATCH (0/1) + WB_TOPIC_LIST (pipe-separated) -> soft preference
     """
     debug = _env_bool("WB_DEBUG", False)
+    max_results = _env_int("WB_MAX_RESULTS", 60)
+    # Each slice can be up to 1000 (API limit). We keep it modest to be kind.
+    slice_top_default = min( max_results, 500 )
+    slice_top = _env_int("WB_F1_SLICE_TOP", slice_top_default)
+    slice_top = max(1, min(slice_top, 1000))
+    pages = max(1, min(_env_int("WB_PAGES", 1), 10))  # read that many tail slices
 
-    since_iso_env = (datetime.utcnow().date() - timedelta(days=_env_int("WB_PUB_WINDOW_DAYS", days_back))).isoformat()
-    rows = _rows_cap(default=min(100, _env_int("WB_ROWS", 100)), env_name="WB_ROWS", max_allowed=200)
-    pages = max(1, min(_env_int("WB_PAGES", 8), 10))
-    max_results = _env_int("WB_MAX_RESULTS", 500)
-    qterm = os.getenv("WB_QTERM", "")  # keep empty unless you really want to narrow
+    # Probe count
+    try:
+        probe = _fetch_slice(top=1, skip=0, debug=debug)
+        total = int(probe.get("count", 0))
+        if debug:
+            print(f"[worldbank:F1] total={total}")
+    except Exception as e:
+        if debug:
+            print(f"[worldbank:F1] probe failed: {e}")
+        return []
 
-    out: List[Dict[str, Any]] = []
-    offset = 0
-
-    for page in range(pages):
-        params = {
-            "format": "json",
-            "qterm": qterm,
-            "fl": "id,notice,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
-            "os": offset,
-            "rows": rows,
-        }
+    items: List[Dict[str, Any]] = []
+    collected = 0
+    # Walk backward from the tail: last page, then previous, etc.
+    for i in range(pages):
+        if total <= 0:
+            break
+        top_now = min(slice_top, max_results - collected)
+        if top_now <= 0:
+            break
+        skip = max(total - ((i + 1) * top_now), 0)
         try:
-            r = requests.get(BASE, params=params, headers=HEADERS, timeout=45)
-            if r.status_code >= 500:
-                if debug:
-                    print(f"[worldbank] page={page} rows={rows} -> {r.status_code}; retry smaller page")
-                time.sleep(1.0)
-                if rows > 50:
-                    rows = 50
-                    # retry this page with smaller rows
-                    continue
-            r.raise_for_status()
-            j = r.json()
+            chunk = _fetch_slice(top=top_now, skip=skip, debug=debug)
         except Exception as e:
             if debug:
-                print(f"[worldbank] WARN request failed: {e}")
-            break
+                print(f"[worldbank:F1] slice {i} failed: {e}")
+            time.sleep(0.8)
+            continue
 
-        docs = _safe_docs(j)
-        if not docs:
-            if debug:
-                print(f"[worldbank] no docs on page {page}")
-            break
+        rows = chunk.get("data") or []
+        if debug:
+            print(f"[worldbank:F1] slice {i} rows={len(rows)} skip={skip} top={top_now}")
 
-        added_this_page = 0
-        for d in docs:
-            title = (d.get("notice") or d.get("title") or "").strip()
+        for d in rows:
+            # Field names per dataset page:
+            # bid_description, publication_date, deadline_date, country_name, url, ...
+            title = (d.get("bid_description") or d.get("notice_type") or "").strip()
             if not title:
                 continue
-            url = d.get("noticeurl") or d.get("url") or ""
-            country = d.get("countryshortname") or d.get("operatingunit") or ""
-            deadline = _to_iso(d.get("submissiondeadline"))
-            pubdate = _to_iso(d.get("publicationdate"))
+            url = d.get("url") or ""
+            country = d.get("country_name") or ""
+            pub_iso = _to_iso(d.get("publication_date"))
+            deadline_iso = _to_iso(d.get("deadline_date"))
 
-            # Keep logic (soft):
-            # - If pubdate exists: keep only if within window
-            # - Else if deadline exists: keep only if deadline >= since window
-            # - Else: keep (don't drop for missing fields)
+            # Soft recency: keep if either date is within 'days_back' (if present). If both missing, keep.
+            since = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
             keep = True
-            if pubdate:
-                keep = pubdate >= since_iso_env
-            elif deadline:
-                keep = deadline >= since_iso_env
-            # if both missing, keep = True (permissive)
+            if pub_iso:
+                keep = keep and (pub_iso >= since)
+            if deadline_iso:
+                keep = keep and (deadline_iso >= since)
+            # if both missing, keep remains True
 
             if not keep:
                 continue
 
-            summary = f"{title} {country} pub:{pubdate or ''}".lower()
-            item = {
+            items.append({
                 "title": title,
-                "source": "World Bank",
-                "deadline": deadline,  # may be None
+                "source": "World Bank (F1)",
+                "deadline": deadline_iso,
                 "country": country,
-                "topic": None,         # assigned later by your normalizer if needed
+                "topic": None,
                 "url": url,
-                "summary": summary,
-            }
-            out.append(item)
-            added_this_page += 1
-            if len(out) >= max_results:
+                "summary": f"{title} {country} pub:{pub_iso or ''}".lower(),
+            })
+            collected += 1
+            if collected >= max_results:
                 break
-
-        if debug:
-            print(f"[worldbank] page={page} added={added_this_page} total={len(out)}")
-
-        if len(out) >= max_results:
+        if collected >= max_results:
             break
-        offset += rows
 
-    # ---- soft OGP filter & exclusion (never zero-out) ----
+    # ---- Soft OGP & exclusions (never zero out) ----
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            relevant = [it for it in out
-                        if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")]
-            out = _prefer_or_fallback(relevant, out)  # prefer matches, fallback to all if none
-            out = [it for it in out
-                   if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+            preferred = [it for it in items if ogp_relevant(f"{it['title']} {it.get('summary','')}")]
+            items = _prefer_or_fallback(preferred, items)
+            items = [it for it in items if not is_excluded(f"{it['title']} {it.get('summary','')}")]
         except Exception:
-            # filters not present; keep 'out' as-is
             pass
 
-    # ---- soft topic preference (never zero-out) ----
+    # ---- Soft topic preference (env-driven) ----
     require_topic_match = _env_bool("WB_REQUIRE_TOPIC_MATCH", False)
     topic_raw = os.getenv("WB_TOPIC_LIST", "")
     topic_list = [t.strip().lower() for t in topic_raw.split("|") if t.strip()]
-
     if require_topic_match and topic_list:
         matched = []
-        for it in out:
+        for it in items:
             text = f"{it.get('title','')} {it.get('summary','')}".lower()
             if any(t in text for t in topic_list):
                 matched.append(it)
-        out = _prefer_or_fallback(matched, out)  # prefer matches if any; otherwise keep all
+        items = _prefer_or_fallback(matched, items)
 
-    return out
+    return items
 
-# --------------------- public APIs ---------------------
+# ---------------- public APIs ----------------
 
 class Connector:
     def fetch(self, days_back: int = 90):
-        # Class-based API
         return _wb_fetch_impl(days_back=days_back, ogp_only=True)
 
 def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    # Function-based API (back-compat with your aggregator)
     return _wb_fetch_impl(days_back=since_days, ogp_only=ogp_only)
 
 def accepted_args():
-    # For your logging
     return ["ogp_only", "since_days"]
