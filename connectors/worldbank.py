@@ -317,38 +317,30 @@ if __name__ == "__main__":
         print("-", it["title"], "| pub:", it.get("_pub",""), "| deadline:", it.get("deadline",""), "| topics:", it.get("themes",""), "|", it["url"])
 
 # ---- Back-compat procedural API (for existing aggregator) ----
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+# ---------------- World Bank connector: non-recursive wiring ----------------
+# One true implementation function. Everything else delegates to this.
+def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True):
     """
-    Backwards-compatible wrapper so old aggregator imports work:
-      from connectors.X import fetch as fetch_X
+    Your existing logic goes here.
+    If you already have a function-style parser, move its body here
+    (or just call that internal function from here).
+    Return a list of normalized-ish dicts.
     """
-    items = Connector().fetch(days_back=since_days)
-    if ogp_only:
-        try:
-            from filters import ogp_relevant
-            filt = []
-            for it in items:
-                text = f"{it.get('title','')} {it.get('summary','')}"
-                if ogp_relevant(text):
-                    filt.append(it)
-            items = filt
-        except Exception:
-            # If filters module not present, just return items
-            pass
-    return items
-
-def accepted_args():
-    # Preserve your logging of accepted args
-    return ["ogp_only", "since_days"]
-
-# If your module already exposes a function-style fetch(ogp_only=True, since_days=90, **kwargs)
-# we add a class so the aggregator can use either style.
+    # EXAMPLE:
+    # return _parse_worldbank(days_back=days_back, ogp_only=ogp_only)
+    # If your existing function was named `fetch`, rename it to `_wb_parse`
+    # and call it here instead of re-implementing.
+    raise NotImplementedError("Hook up _wb_fetch_impl to your existing WB parser.")
 
 class Connector:
     def fetch(self, days_back: int = 90):
-        # Reuse your existing function-style fetch
-        try:
-            return fetch(ogp_only=True, since_days=days_back)
-        except TypeError:
-            # If your fetch doesn't accept ogp_only, just pass days_back
-            return fetch(since_days=days_back)
+        # DO NOT call fetch() here (that would recurse via the back-compat wrapper).
+        return _wb_fetch_impl(days_back=days_back, ogp_only=True)
+
+# ---- Back-compat procedural API (for existing aggregator) ----
+def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+    # DO NOT call Connector().fetch() here (that would recurse if Connector called fetch).
+    return _wb_fetch_impl(days_back=since_days, ogp_only=ogp_only)
+
+def accepted_args():
+    return ["ogp_only", "since_days"]
