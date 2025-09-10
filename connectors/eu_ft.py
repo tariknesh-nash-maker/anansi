@@ -1,82 +1,89 @@
+# anansi/connectors/eu_ft.py
 from __future__ import annotations
 from typing import List, Dict, Any
-import json, re, html
+from datetime import datetime, timedelta
 import requests
 import dateparser
+import html
 
-API = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; anansi/1.0)"}
+API = "https://api.ted.europa.eu/v3/notices/search"
+UA  = "Mozilla/5.0 (compatible; anansi/1.0)"
+HEADERS = {"User-Agent": UA, "Content-Type": "application/json"}
+
+def _yyyymmdd(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d")
 
 def _to_iso(s: str | None) -> str | None:
     if not s:
         return None
-    dt = dateparser.parse(
-        s,
-        settings={"DATE_ORDER": "DMY", "PREFER_DAY_OF_MONTH": "first"},
-        languages=["en","fr","es","de","it","pt"]
-    )
-    return dt.date().isoformat() if dt else None
+    # TED may return '2025-02-13Z' or '2025-02-13+01:00' → dateparser handles both
+    d = dateparser.parse(s, settings={"DATE_ORDER":"DMY","PREFER_DAY_OF_MONTH":"first"})
+    return d.date().isoformat() if d else None
 
 def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    """
-    Robust mode: query EVERYTHING, then filter locally to Funding & Tenders 'opportunities'
-    (both calls for proposals and calls for tenders). This avoids brittle status/type codes.
-    """
-    items: List[Dict[str,Any]] = []
+    since = datetime.utcnow().date() - timedelta(days=days_back)
+    since_yyyymmdd = _yyyymmdd(datetime(since.year, since.month, since.day))
+
+    # We request a small, safe field set and rebuild the human URL from publication-number:
+    fields = [
+        "publication-number",      # e.g. 76817-2024
+        "notice-title",            # human title
+        "publication-date",        # for freshness
+        "deadline-received-tenders",  # submission deadline if present
+        "buyer-country",           # country code
+        # (we keep it lean; more fields can be added if needed)
+    ]
+
     page = 1
-    page_size = 50
+    limit = 50  # max 250; 50 is gentle
 
-    # Minimal query; we’ll filter by URL/domain in-code.
-    query = {"bool": {"must": []}}
-    languages = ["en"]
-    sort = {"field": "relevance", "order": "DESC"}
-
+    items: List[Dict[str, Any]] = []
     while True:
-        resp = requests.post(
-            API,
-            params={"apiKey": "SEDIA", "text": "*", "pageSize": str(page_size), "pageNumber": str(page)},
-            files={
-                "query": ("blob", json.dumps(query), "application/json"),
-                "languages": ("blob", json.dumps(languages), "application/json"),
-                "sort": ("blob", json.dumps(sort), "application/json"),
-            },
-            headers=HEADERS,
-            timeout=45,
-        )
-        resp.raise_for_status()
-        data = resp.json() or {}
+        body = {
+            # Expert query: all ACTIVE notices published since our window
+            # Field alias PD = publication-date (official TED help docs)
+            "query": f"(publication-date >= {since_yyyymmdd})",
+            "fields": fields,
+            "page": page,
+            "limit": limit,
+            "scope": "ACTIVE",
+            "checkQuerySyntax": False,
+            "paginationMode": "PAGE_NUMBER",
+        }
+        r = requests.post(API, json=body, headers=HEADERS, timeout=45)
+        r.raise_for_status()
+        data = r.json() or {}
+
         results = data.get("results") or data.get("items") or []
         if not results:
             break
 
-        for r in results:
-            # Keep only Funding & Tenders 'opportunities' pages
-            url = r.get("url") or r.get("destination") or r.get("destinationPage") or ""
-            if "/opportunities/" not in (url or ""):
+        for row in results:
+            pub_no = (row.get("publication-number") or "").strip()
+            if not pub_no:
                 continue
-            # Heuristic: only calls (for proposals/tenders/topics), not guidance pages
-            blob = " ".join(str(r.get(k, "")) for k in ("title", "titleTranslated", "description","statusLabel","programme")).lower()
-            if not any(x in blob for x in ["call", "calls", "tender", "topic"]):
-                continue
+            url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
 
-            title = (r.get("title") or r.get("titleTranslated") or "").strip()
-            deadline = _to_iso(r.get("deadlineDate") or r.get("endDate") or r.get("deadline") or r.get("closeDate"))
+            title = html.unescape((row.get("notice-title") or "").strip()) or "EU opportunity"
+            pub_iso = _to_iso(row.get("publication-date"))
+            deadline = _to_iso(row.get("deadline-received-tenders"))
+            country = row.get("buyer-country") or ""
 
             items.append({
-                "title": html.unescape(title) or "EU opportunity",
-                "source": "EU F&T",
+                "title": title,
+                "source": "EU TED",
                 "deadline": deadline,
-                "country": r.get("country") or "",
+                "country": country,
                 "topic": None,
                 "url": url,
-                "summary": blob,
+                "summary": f"{title} {country} pub:{pub_iso or ''}".lower(),
             })
 
-        total = (data.get("total") or data.get("resultCount") or 0) or 0
-        if total and page * page_size >= int(total):
+        total = int(data.get("total", 0) or 0)
+        if total and page * limit >= total:
             break
         page += 1
-        if page > 4:  # safety bound
+        if page > 6:   # safety cap
             break
 
     if ogp_only:
@@ -87,6 +94,7 @@ def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[st
                      and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
+
     return items
 
 class Connector:
