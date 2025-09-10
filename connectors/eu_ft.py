@@ -2,33 +2,49 @@
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta, timezone
-import os, json, html, logging, requests
+import os, json, html, requests
 
-from utils.debug_utils import is_on, dump_json, dump_text, kv
+# --- minimal debug helpers (no external dep) ---
+def _is_on(*envs: str) -> bool:
+    for e in envs:
+        v = os.getenv(e)
+        if v and str(v).strip().lower() in ("1","true","yes","on"): return True
+    return False
+def _kv(prefix: str, **kw):
+    print(f"[{prefix}] " + " ".join(f"{k}={repr(v)}" for k,v in kw.items()))
 
 API_URL = "https://api.ted.europa.eu/v3/notices/search"
 UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
+
+# Default fields per official demo (Publication no., Title, Buyer, Type, Pub date, Place)
+DEFAULT_FIELDS = [
+    "publication-number", "notice-title", "buyer-name",
+    "notice-type", "publication-date", "place-of-performance"
+]
+# Allow override via env (comma-separated)
+_env_fields = [x.strip() for x in os.getenv("EUFT_FIELDS","").split(",") if x.strip()]
+FIELDS = _env_fields or DEFAULT_FIELDS
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Content-Type": "application/json"})
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+})
 
 def _yyyymmdd(d: datetime) -> str:
     return d.strftime("%Y%m%d")
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
 def _build_query(days_back: int) -> str:
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days_back)
+    # v3 supports expert query syntax like "publication-date>=YYYYMMDD"
     return f"publication-date>={_yyyymmdd(datetime(cutoff.year, cutoff.month, cutoff.day))}"
 
 def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
-    pub_no = (row.get("publication-number") or row.get("publicationNumber") or row.get("publication_number") or "").strip()
+    pub_no = (row.get("publication-number") or "").strip()
     if not pub_no:
         return None
-    title = (row.get("notice-title") or row.get("title") or f"TED Notice {pub_no}").strip()
+    title = (row.get("notice-title") or f"TED Notice {pub_no}").strip()
     url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
     text = title.lower()
     topic = None
@@ -50,68 +66,57 @@ def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
 
 def _post(query: str, page: int, limit: int, verbose: bool) -> list[dict]:
     payload = {
-        "query": query,  # REQUIRED
+        "query": query,                      # REQUIRED
+        "fields": FIELDS,                    # REQUIRED (fix for 400)
         "page": page,
         "limit": limit,
-        "paginationMode": "PAGE_NUMBER",
+        "scope": os.getenv("EUFT_SCOPE","ACTIVE"),      # ACTIVE | LATEST | ALL
         "checkQuerySyntax": False,
+        "paginationMode": "PAGE_NUMBER",
     }
     r = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
-    if verbose:
-        kv("eu_ft:req", query=query, page=page, limit=limit, http=r.status_code, bytes=len(r.text or ""))
-        dump_json("euft-payload", payload)
-        dump_text("euft-response", r.text[:4000])
+    if verbose or r.status_code >= 400:
+        _kv("eu_ft:req", query=query, page=page, limit=limit, http=r.status_code, bytes=len(r.text or ""))
+        if r.status_code >= 400:
+            print(f"[eu_ft] HTTP {r.status_code}: {r.text[:300]}")
     try:
         r.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"[eu_ft] HTTP {r.status_code}: {e} body={r.text[:300]}")
+    except requests.HTTPError:
         return []
-    data = {}
     try:
         data = r.json() or {}
     except Exception:
-        if verbose:
-            print("[eu_ft] WARN: response not JSON-decodable")
+        print("[eu_ft] WARN: response not JSON")
+        return []
     rows = data.get("results") or data.get("items") or []
     if verbose:
-        kv("eu_ft:parsed", rows=len(rows), total=data.get("total"))
-        dump_json("euft-json", data)
+        _kv("eu_ft:parsed", rows=len(rows), total=data.get("total"))
     return rows
 
 def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    # Turn on verbose if env says so OR if we end up with zero results
-    env_verbose = is_on("EUFT_DEBUG", "DEBUG")
-    limit = min(_env_int("EUFT_MAX", 40), 250)
+    verbose = _is_on("EUFT_DEBUG","DEBUG")
+    limit = min(int(os.getenv("EUFT_MAX","40")), 250)
     page = 1
 
-    primary_q = os.getenv("EUFT_QUERY") or _build_query(days_back)
-    variants = [primary_q, primary_q.replace("publication-date", "PD"), "place-of-performance IN (LUX)"]
+    base_q = os.getenv("EUFT_QUERY") or _build_query(days_back)
+    variants = [base_q, base_q.replace("publication-date","PD")]  # PD is accepted alias in demos
 
     items: List[Dict[str, Any]] = []
-    last_rows = 0
     for idx, q in enumerate(variants):
-        rows = _post(q, page, limit, verbose=env_verbose)
-        last_rows = len(rows)
+        rows = _post(q, page, limit, verbose=verbose)
         normed = [n for r in rows if (n := _normalize(r))]
-        if env_verbose:
-            kv("eu_ft:norm", variant=idx, normed=len(normed))
+        if verbose: _kv("eu_ft:norm", variant=idx, normed=len(normed))
         if normed:
             items = normed
             break
 
-    # If still zero, force verbose one more time so logs show up even without env flags
-    if not items and not env_verbose:
-        kv("eu_ft:empty", tried=len(variants), last_rows=last_rows, forcing_verbose=True)
-        # re-run the first variant just to print diagnostics
-        _post(variants[0], page, limit, verbose=True)
+    if not items and not verbose:
+        # force one diagnostic emission if still empty
+        _post(base_q, page, limit, verbose=True)
 
-    # Soft OGP preference (don’t zero-out)
     if ogp_only and items:
         preferred = [it for it in items if it.get("topic")]
-        if env_verbose:
-            kv("eu_ft:ogp", raw=len(items), preferred=len(preferred))
         items = preferred or items
-
     return items
 
 class Connector:
