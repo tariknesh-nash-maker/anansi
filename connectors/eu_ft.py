@@ -1,3 +1,14 @@
+# connectors/eu_ft.py
+# EU: Tenders Electronic Daily (TED) Search API v3
+# - Anonymous access
+# - Expert-query filters by publication date (PD) per TED help
+# - Builds official notice URLs from publication number
+#
+# Env:
+#   EUFT_SINCE_DAYS (default 60)
+#   EUFT_MAX (default 40)
+#   EUFT_DEBUG (0/1)
+
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
@@ -11,71 +22,108 @@ HEADERS = {"User-Agent": UA, "Content-Type": "application/json"}
 def _yyyymmdd(d: datetime) -> str:
     return d.strftime("%Y%m%d")
 
-def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    since = datetime.utcnow().date() - timedelta(days=days_back)
-    query = f"(publication-date >= {_yyyymmdd(datetime(since.year, since.month, since.day))})"
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
-    page, limit = 1, 50
-    items: List[Dict[str, Any]] = []
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip().lower() in ("1","true","yes")
+
+def _pick(d: Dict[str, Any], *keys):
+    for k in keys:
+        if k in d and d[k]:
+            return d[k]
+    return None
+
+def _eu_fetch(days_back: int = 60, ogp_only: bool = True) -> List[Dict[str, Any]]:
+    debug = _env_bool("EUFT_DEBUG", False)
+    since = datetime.utcnow().date() - timedelta(days=days_back)
+    # TED "expert query" — PD is an alias of publication-date
+    # docs confirm PD / publication-date are valid equivalents.  (see citations)
+    query = f"PD>={_yyyymmdd(datetime(since.year, since.month, since.day))}"
+
+    out: List[Dict[str, Any]] = []
+    page = 1
+    limit = min(_env_int("EUFT_MAX", 40), 250)  # TED per-page hard cap is 250
 
     while True:
         body = {
             "query": query,
-            "fields": ["publication-number", "notice-title", "buyer-name", "notice-type"],
+            # omit "fields" entirely to avoid 400 with unsupported names
             "page": page,
             "limit": limit,
-            "scope": "ACTIVE",
-            "checkQuerySyntax": False,
             "paginationMode": "PAGE_NUMBER",
+            "checkQuerySyntax": False,
         }
-        r = requests.post(API, headers=HEADERS, data=json.dumps(body), timeout=45)
-        r.raise_for_status()
-        data = r.json() or {}
+        try:
+            r = requests.post(API, headers=HEADERS, data=json.dumps(body), timeout=45)
+            r.raise_for_status()
+            data = r.json() or {}
+        except Exception as e:
+            if debug:
+                print(f"[eu_ft] WARN request failed page={page}: {e}")
+            break
+
         results = data.get("results") or data.get("items") or []
+        if debug:
+            total = data.get("total")
+            print(f"[eu_ft] page={page} got={len(results)} total={total}")
+
         if not results:
             break
 
         for row in results:
-            pub_no = (row.get("publication-number") or "").strip()
+            # The key names vary; try several common variants
+            pub_no = (
+                _pick(row, "publication-number", "publicationNumber", "publication_number")
+                or ""
+            ).strip()
+            title = (
+                _pick(row, "notice-title", "title", "ND-Title") or "EU opportunity"
+            ).strip()
+
+            # If no publication number, we can’t build the official URL — skip
             if not pub_no:
                 continue
-            url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"  # official pattern :contentReference[oaicite:1]{index=1}
-            title = (row.get("notice-title") or "").strip() or "EU opportunity"
-            buyer = (row.get("buyer-name") or "").strip()
-            ntype = (row.get("notice-type") or "").strip()
-            items.append({
+
+            # Official notice URL pattern per TED help:
+            # https://ted.europa.eu/{lang}/notice/-/detail/{publication-number}
+            url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
+
+            out.append({
                 "title": html.unescape(title),
                 "source": "EU TED",
-                "deadline": None,              # not requested in 'fields'; can be added later if needed
-                "country": "",                 # buyer country requires extra field(s); keeping lean for now
+                "deadline": None,          # can be added later if we request more fields
+                "country": "",
                 "topic": None,
                 "url": url,
-                "summary": f"{title} {buyer} {ntype}".lower(),
+                "summary": f"{title} {pub_no}".lower(),
             })
 
-        total = int(data.get("total") or 0)
-        if total and page * limit >= total:
-            break
-        page += 1
-        if page > 6:
-            break
+        # Stop after first page: we only need fresh items
+        break
 
+    # Light OGP filtering only if your filters.py is present (never zero-out)
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            items = [it for it in items
-                     if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
-                     and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+            preferred = [it for it in out if ogp_relevant(f"{it['title']} {it.get('summary','')}")]
+            out = preferred or out
+            out = [it for it in out if not is_excluded(f"{it['title']} {it.get('summary','')}")]
         except Exception:
             pass
-    return items
+
+    return out
 
 class Connector:
-    def fetch(self, days_back: int = 90):
-        return _euft_fetch_impl(days_back=days_back, ogp_only=True)
+    def fetch(self, days_back: int = 60):
+        return _eu_fetch(days_back=days_back, ogp_only=True)
 
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    return _euft_fetch_impl(days_back=since_days, ogp_only=ogp_only)
+def fetch(ogp_only: bool = True, since_days: int = 60, **kwargs):
+    return _eu_fetch(days_back=since_days, ogp_only=ogp_only)
 
 def accepted_args():
     return ["ogp_only", "since_days"]
