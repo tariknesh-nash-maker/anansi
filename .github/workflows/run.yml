@@ -28,7 +28,9 @@ jobs:
           DEBUG_DUMP_DIR: "_debug"
           EUFT_DEBUG: "1"     # optional; we still force logs on 0
           AFDB_DEBUG: "1"     # optional; we still force logs on 0
-          
+          AFDB_USE_READER: "1"        # enables the reader fallback if 403 persists
+          DEBUG: "1"
+
           WB_ROWS: "800"               # scan 800 rows per page
           WB_PAGES: "10"               # scan 8,000 newest rows
           WB_PUB_WINDOW_DAYS: "180"    # widen while validating; reduce to 90 later
