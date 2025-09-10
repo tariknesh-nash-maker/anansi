@@ -340,3 +340,15 @@ def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
 def accepted_args():
     # Preserve your logging of accepted args
     return ["ogp_only", "since_days"]
+
+# If your module already exposes a function-style fetch(ogp_only=True, since_days=90, **kwargs)
+# we add a class so the aggregator can use either style.
+
+class Connector:
+    def fetch(self, days_back: int = 90):
+        # Reuse your existing function-style fetch
+        try:
+            return fetch(ogp_only=True, since_days=days_back)
+        except TypeError:
+            # If your fetch doesn't accept ogp_only, just pass days_back
+            return fetch(since_days=days_back)
