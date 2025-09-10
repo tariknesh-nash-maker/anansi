@@ -19,41 +19,22 @@ def _to_iso(s: str | None) -> str | None:
 
 def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
     """
-    Pull 'Open' and 'Forthcoming' Calls for Proposals from the EU Funding & Tenders portal
-    via the public Search API.
-
-    Notes:
-      - status 31094502 = Open for submission
-      - status 31094501 = Forthcoming
-      - type 1/2 are calls/topics buckets commonly exposed in portal listings
-      - We do NOT filter by frameworkProgramme to keep DG INTPA/NDICI items in
+    Robust mode: query EVERYTHING, then filter locally to Funding & Tenders 'opportunities'
+    (both calls for proposals and calls for tenders). This avoids brittle status/type codes.
     """
     items: List[Dict[str,Any]] = []
     page = 1
     page_size = 50
 
-    # Search body (multipart form-data per EC examples)
-    query = {
-        "bool": {
-            "must": [
-                {"terms": {"type": ["1","2"]}},
-                {"terms": {"status": ["31094502","31094501"]}},
-            ]
-        }
-    }
-    languages = ["en"]  # results have translated titles; we can expand later
-    sort = {"field": "sortStatus", "order": "ASC"}
+    # Minimal query; we’ll filter by URL/domain in-code.
+    query = {"bool": {"must": []}}
+    languages = ["en"]
+    sort = {"field": "relevance", "order": "DESC"}
 
     while True:
-        params = {
-            "apiKey": "SEDIA",
-            "text": "*",
-            "pageSize": str(page_size),
-            "pageNumber": str(page),
-        }
         resp = requests.post(
             API,
-            params=params,
+            params={"apiKey": "SEDIA", "text": "*", "pageSize": str(page_size), "pageNumber": str(page)},
             files={
                 "query": ("blob", json.dumps(query), "application/json"),
                 "languages": ("blob", json.dumps(languages), "application/json"),
@@ -64,44 +45,40 @@ def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[st
         )
         resp.raise_for_status()
         data = resp.json() or {}
-
         results = data.get("results") or data.get("items") or []
         if not results:
             break
 
         for r in results:
-            title = (r.get("title") or r.get("titleTranslated") or "").strip()
-            if not title:
-                continue
+            # Keep only Funding & Tenders 'opportunities' pages
             url = r.get("url") or r.get("destination") or r.get("destinationPage") or ""
-            # common date fields seen in the API
+            if "/opportunities/" not in (url or ""):
+                continue
+            # Heuristic: only calls (for proposals/tenders/topics), not guidance pages
+            blob = " ".join(str(r.get(k, "")) for k in ("title", "titleTranslated", "description","statusLabel","programme")).lower()
+            if not any(x in blob for x in ["call", "calls", "tender", "topic"]):
+                continue
+
+            title = (r.get("title") or r.get("titleTranslated") or "").strip()
             deadline = _to_iso(r.get("deadlineDate") or r.get("endDate") or r.get("deadline") or r.get("closeDate"))
-            country = r.get("country") or r.get("geographicalZones") or ""
-            summary = " ".join([
-                title,
-                r.get("programme", "") or r.get("programmeAcronym","") or "",
-                r.get("statusLabel","") or "",
-            ]).lower()
 
             items.append({
-                "title": html.unescape(title),
+                "title": html.unescape(title) or "EU opportunity",
                 "source": "EU F&T",
                 "deadline": deadline,
-                "country": country if isinstance(country, str) else ", ".join(country or []),
+                "country": r.get("country") or "",
                 "topic": None,
                 "url": url,
-                "summary": summary,
+                "summary": blob,
             })
 
-        # stop when no more pages
         total = (data.get("total") or data.get("resultCount") or 0) or 0
         if total and page * page_size >= int(total):
             break
         page += 1
-        if page > 10:  # hard safety bound
+        if page > 4:  # safety bound
             break
 
-    # Optional OGP filtering (multilingual) + exclude auctions if your filters.py is present
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
@@ -110,14 +87,12 @@ def _euft_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[st
                      and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
-
     return items
 
 class Connector:
     def fetch(self, days_back: int = 90):
         return _euft_fetch_impl(days_back=days_back, ogp_only=True)
 
-# ---- Back-compat procedural API (for existing aggregator) ----
 def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
     return _euft_fetch_impl(days_back=since_days, ogp_only=ogp_only)
 
