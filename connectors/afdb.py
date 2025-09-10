@@ -1,5 +1,6 @@
 # connectors/afdb.py
-# AfDB procurement: use SPN/GPN RSS; if empty, scrape listing pages as fallback.
+# AfDB procurement: try SPN/GPN RSS feeds; if empty, scrape listing pages as fallback.
+
 from __future__ import annotations
 from typing import List, Dict, Any, Set
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from bs4 import BeautifulSoup
 UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
 HEADERS = {"User-Agent": UA}
 
-# Real feeds (confirmed)
+# Real feeds (SPN/GPN)
 SPN_RSS = "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml"
 GPN_RSS = "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml"
 RSS_FEEDS = [SPN_RSS, GPN_RSS]
@@ -41,7 +42,8 @@ def _to_date_from_struct(tm) -> datetime | None:
 
 def _parse_deadline(text: str) -> str | None:
     m = DEADLINE_RE.search(text or "")
-    if not m: return None
+    if not m:
+        return None
     try:
         return datetime.strptime(m.group(1), "%d %B %Y").date().isoformat()
     except Exception:
@@ -57,7 +59,7 @@ def _rss_fetch(days_back: int, max_items: int, debug: bool) -> List[Dict[str, An
                 logging.info(f"[afdb] RSS url={url} status={getattr(feed,'status','?')} entries={len(feed.entries)}")
             for e in feed.entries:
                 title = (getattr(e, "title", "") or "").strip()
-                link  = (getattr(e, "link", "") or "").strip()
+                link = (getattr(e, "link", "") or "").strip()
                 if not title or not link:
                     continue
                 pub_dt = None
@@ -83,6 +85,7 @@ def _rss_fetch(days_back: int, max_items: int, debug: bool) -> List[Dict[str, An
         except Exception as ex:
             if debug:
                 logging.warning(f"[afdb] RSS failed {url}: {ex}")
+            # Continue to next feed even if one fails
             continue
     return out
 
@@ -91,10 +94,10 @@ def _collect_listing_links(url: str, debug: bool) -> Set[str]:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
     links: Set[str] = set()
-    # AfDB uses Drupal view rows with h3 > a for item links
     for a in soup.select("h3 a[href], .views-row a[href]"):
         href = a.get("href", "")
-        if not href: continue
+        if not href:
+            continue
         full = href if href.startswith("http") else f"https://www.afdb.org{href}"
         if "/en/" in full and "/procurement" in full:
             links.add(full)
@@ -111,7 +114,7 @@ def _parse_detail(url: str, debug: bool) -> Dict[str, Any] | None:
         title = (title_tag.get_text(" ", strip=True) if title_tag else "AfDB Notice").strip()
         text = soup.get_text(" ", strip=True)
         deadline = None
-        # Look for labeled fields first
+        # labeled fields first
         for dt in soup.select("dt, strong, b"):
             label = dt.get_text(" ", strip=True).lower()
             if "dead" in label or "clos" in label:
@@ -121,7 +124,7 @@ def _parse_detail(url: str, debug: bool) -> Dict[str, Any] | None:
                 if dl_try:
                     deadline = dl_try
                     break
-        # Fallback: regex across whole page
+        # fallback: regex across page
         if not deadline:
             deadline = _parse_deadline(text)
         return {
@@ -154,14 +157,37 @@ def _afdb_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, An
     debug = _env_bool("AFDB_DEBUG", False)
     max_items = _env_int("AFDB_MAX", 40)
 
-    # 1) Try RSS first (fast & stable)
+    # 1) RSS first (fast & stable)
     items = _rss_fetch(days_back=days_back, max_items=max_items, debug=debug)
     if items:
         return _apply_filters(items, ogp_only)
 
-    # 2) Fallback: scrape listing pages -> detail pages (slower, but robust)
+    # 2) Fallback: scrape listing pages → detail pages
     links: Set[str] = set()
     for lp in LISTING_PAGES:
         try:
             links |= _collect_listing_links(lp, debug=debug)
         except Exception as ex:
+            if debug:
+                logging.warning(f"[afdb] listing failed {lp}: {ex}")
+            continue
+
+    out: List[Dict[str, Any]] = []
+    for u in list(links)[: max_items * 2]:
+        it = _parse_detail(u, debug=debug)
+        if it:
+            out.append(it)
+        if len(out) >= max_items:
+            break
+
+    return _apply_filters(out, ogp_only)
+
+class Connector:
+    def fetch(self, days_back: int = 90):
+        return _afdb_fetch(days_back=days_back, ogp_only=True)
+
+def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+    return _afdb_fetch(days_back=since_days, ogp_only=ogp_only)
+
+def accepted_args():
+    return ["ogp_only", "since_days"]
