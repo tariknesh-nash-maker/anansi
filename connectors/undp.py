@@ -82,3 +82,28 @@ class Connector:
                 except Exception:
                     continue
         return out
+
+# ---- Back-compat procedural API (for existing aggregator) ----
+def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
+    """
+    Backwards-compatible wrapper so old aggregator imports work:
+      from connectors.X import fetch as fetch_X
+    """
+    items = Connector().fetch(days_back=since_days)
+    if ogp_only:
+        try:
+            from filters import ogp_relevant
+            filt = []
+            for it in items:
+                text = f"{it.get('title','')} {it.get('summary','')}"
+                if ogp_relevant(text):
+                    filt.append(it)
+            items = filt
+        except Exception:
+            # If filters module not present, just return items
+            pass
+    return items
+
+def accepted_args():
+    # Preserve your logging of accepted args
+    return ["ogp_only", "since_days"]
