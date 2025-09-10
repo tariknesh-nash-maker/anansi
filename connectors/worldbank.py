@@ -1,138 +1,134 @@
+# anansi/connectors/world_bank.py
 from __future__ import annotations
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
-import time
+import os, time
 import requests
 import dateparser
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 BASE = "https://search.worldbank.org/api/consultants"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; anansi/1.0)"}
+UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
+HEADERS = {"User-Agent": UA}
 
-def _retry_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=0.8,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    return s
-
-def _to_iso(d: str | None) -> str | None:
-    if not d:
+def _to_iso(s: str | None) -> str | None:
+    if not s:
         return None
-    dt = dateparser.parse(d, settings={"DATE_ORDER": "YMD", "PREFER_DAY_OF_MONTH": "first"})
+    dt = dateparser.parse(s, settings={"DATE_ORDER": "DMY", "PREFER_DAY_OF_MONTH": "first"})
     return dt.date().isoformat() if dt else None
 
-def _parse_hits(j: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if isinstance(j.get("documents"), dict):
-        return list(j["documents"].values())
-    for k in ("documents", "rows", "docs", "items"):
-        if isinstance(j.get(k), list):
-            return j[k]
-    if isinstance(j.get("hits"), dict):
-        return list(j["hits"].values())
-    return []
+def _rows_cap(default:int, env_name:str, max_allowed:int=200) -> int:
+    try:
+        v = int(os.getenv(env_name, str(default)))
+    except Exception:
+        v = default
+    return max(1, min(v, max_allowed))  # WB API chokes on very large rows
 
-def _total_count(j: Dict[str, Any]) -> int:
-    for k in ("total", "count", "numFound"):
-        if isinstance(j.get(k), int):
-            return j[k]
-    if isinstance(j.get("result"), dict) and isinstance(j["result"].get("total"), int):
-        return j["result"]["total"]
-    return 0
+def _pages_cap(default:int, env_name:str, hard_cap:int=10) -> int:
+    try:
+        v = int(os.getenv(env_name, str(default)))
+    except Exception:
+        v = default
+    return max(1, min(v, hard_cap))
 
 def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    since_date = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
-    today_iso = datetime.utcnow().date().isoformat()
+    """
+    Robust pull from the classic WB consultants endpoint.
+    We avoid strict pre-filters that can zero out results.
+    Env knobs (optional):
+      WB_ROWS (<=200), WB_PAGES (<=10), WB_MAX_RESULTS, WB_PUB_WINDOW_DAYS
+    """
+    since_iso = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
+    rows = _rows_cap(default=100, env_name="WB_ROWS", max_allowed=200)
+    pages = _pages_cap(default=8, env_name="WB_PAGES", hard_cap=10)
+    max_results = int(os.getenv("WB_MAX_RESULTS", "500"))
+    pub_window_days = int(os.getenv("WB_PUB_WINDOW_DAYS", str(days_back)))
 
-    sess = _retry_session()
-    items: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     offset = 0
-    rows = 100
-    tried_fallback = False
 
-    while True:
+    for _ in range(pages):
         params = {
             "format": "json",
-            "qterm": "",  # leave empty; filter after
-            "fl": "id,notice,noticeid,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
+            # empty qterm returns the catalogue; we filter client-side
+            "qterm": os.getenv("WB_QTERM", ""),
+            # ask for the specific fields we need
+            "fl": "id,notice,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
             "os": offset,
             "rows": rows,
         }
         try:
-            r = sess.get(BASE, params=params, headers=HEADERS, timeout=45)
+            r = requests.get(BASE, params=params, headers=HEADERS, timeout=45)
             if r.status_code >= 500:
+                time.sleep(1.0)
+                # try once more with a smaller page if needed
                 if rows > 50:
                     rows = 50
-                    time.sleep(1.0)
                     continue
             r.raise_for_status()
             j = r.json()
         except Exception:
-            # one-shot ultra-conservative fallback page size
-            if not tried_fallback:
-                tried_fallback = True
-                rows = 25
-                time.sleep(1.0)
-                continue
+            # stop this connector gracefully on repeated errors
             break
 
-        hits = _parse_hits(j)
-        if not hits:
+        docs = []
+        # API can return {"documents": {...}} or lists – normalize
+        if isinstance(j.get("documents"), dict):
+            docs = list(j["documents"].values())
+        elif isinstance(j.get("documents"), list):
+            docs = j["documents"]
+        elif isinstance(j.get("rows"), list):
+            docs = j["rows"]
+        elif isinstance(j.get("hits"), dict):
+            docs = list(j["hits"].values())
+
+        if not docs:
             break
 
-        for doc in hits:
-            title = (doc.get("notice") or doc.get("title") or "").strip()
+        for d in docs:
+            title = (d.get("notice") or d.get("title") or "").strip()
             if not title:
                 continue
-            url = doc.get("noticeurl") or doc.get("url") or ""
-            country = doc.get("countryshortname") or doc.get("operatingunit") or ""
-            deadline_iso = _to_iso(doc.get("submissiondeadline"))
-            pub_iso = _to_iso(doc.get("publicationdate"))
+            url = d.get("noticeurl") or d.get("url") or ""
+            country = d.get("countryshortname") or d.get("operatingunit") or ""
+            deadline = _to_iso(d.get("submissiondeadline"))
+            pubdate = _to_iso(d.get("publicationdate"))
 
-            # Be permissive: keep items even if both dates are missing
+            # gentle time window: keep item if it's recent by pubdate OR has any deadline
             keep = True
-            # But if there is a date, apply the sensible checks
-            if deadline_iso:
-                keep = keep and (deadline_iso >= since_date)
-            if pub_iso:
-                keep = keep and (pub_iso >= since_date)
+            if pub_window_days and pubdate:
+                keep = pubdate >= (datetime.utcnow().date() - timedelta(days=pub_window_days)).isoformat()
+            # if no dates at all, keep (we don't want false negatives)
             if not keep:
                 continue
 
-            items.append({
+            out.append({
                 "title": title,
                 "source": "World Bank",
-                "deadline": deadline_iso,
+                "deadline": deadline,  # may be None
                 "country": country,
-                "topic": None,
+                "topic": None,         # your normalizer/filters assign topic later
                 "url": url,
-                "summary": f"{title} {country} pub:{pub_iso or ''}".lower(),
+                "summary": f"{title} {country} pub:{pubdate or ''}".lower(),
             })
 
-        total = _total_count(j)
-        offset += rows
-        if total and offset >= total:
-            break
-        if offset >= 2000:  # safety
+            if len(out) >= max_results:
+                break
+        if len(out) >= max_results:
             break
 
+        offset += rows
+
+    # Optional OGP filtering (shared filters.py)
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            items = [it for it in items
-                     if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
-                     and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
+            out = [it for it in out
+                   if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
+                   and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
 
-    return items
+    return out
 
 class Connector:
     def fetch(self, days_back: int = 90):
