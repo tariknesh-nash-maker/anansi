@@ -1,11 +1,27 @@
 from __future__ import annotations
 from typing import List, Dict, Any
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+import time
 import requests
 import dateparser
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; anansi/1.0)"}
 BASE = "https://search.worldbank.org/api/consultants"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; anansi/1.0)"}
+
+def _retry_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.8,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    return s
 
 def _to_iso(d: str | None) -> str | None:
     if not d:
@@ -14,18 +30,11 @@ def _to_iso(d: str | None) -> str | None:
     return dt.date().isoformat() if dt else None
 
 def _parse_hits(j: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    The World Bank 'consultants' API returns slightly different shapes over time.
-    We normalize across possible keys.
-    """
-    # 1) dict of id -> doc
     if isinstance(j.get("documents"), dict):
         return list(j["documents"].values())
-    # 2) list of docs
     for k in ("documents", "rows", "docs", "items"):
         if isinstance(j.get(k), list):
             return j[k]
-    # 3) nested hits dict
     if isinstance(j.get("hits"), dict):
         return list(j["hits"].values())
     return []
@@ -34,35 +43,45 @@ def _total_count(j: Dict[str, Any]) -> int:
     for k in ("total", "count", "numFound"):
         if isinstance(j.get(k), int):
             return j[k]
-    # sometimes provided under result/total
     if isinstance(j.get("result"), dict) and isinstance(j["result"].get("total"), int):
         return j["result"]["total"]
     return 0
 
-# ---------------- World Bank connector: non-recursive wiring ----------------
 def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    """
-    Pulls World Bank consultant/procurement notices via the public search API.
-    Returns normalized dicts with keys: title, source, deadline, country, topic, url, summary
-    """
     since_date = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
     today_iso = datetime.utcnow().date().isoformat()
 
-    out: List[Dict[str, Any]] = []
+    sess = _retry_session()
+    items: List[Dict[str, Any]] = []
     offset = 0
-    rows = 200  # API max is commonly 200
+    rows = 100  # start conservative to avoid 500s on large payloads
+    max_offset = 3000
 
     while True:
         params = {
             "format": "json",
-            "qterm": "",  # no keyword filter here; we filter after parsing
+            "qterm": "",
             "fl": "id,notice,noticeid,submissiondeadline,publicationdate,operatingunit,countryshortname,noticeurl",
             "os": offset,
             "rows": rows,
         }
-        r = requests.get(BASE, params=params, headers=HEADERS, timeout=45)
-        r.raise_for_status()
-        j = r.json()
+        try:
+            r = sess.get(BASE, params=params, headers=HEADERS, timeout=45)
+            if r.status_code >= 500:
+                # let Retry handle; if still failing, drop rows size and retry once manually
+                if rows > 50:
+                    rows = 50
+                    time.sleep(1.2)
+                    continue
+            r.raise_for_status()
+            j = r.json()
+        except Exception:
+            # final fallback: reduce page size once more
+            if rows > 25:
+                rows = 25
+                time.sleep(1.2)
+                continue
+            break
 
         hits = _parse_hits(j)
         if not hits:
@@ -72,13 +91,11 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
             title = (doc.get("notice") or doc.get("title") or "").strip()
             if not title:
                 continue
-
             url = doc.get("noticeurl") or doc.get("url") or ""
             country = doc.get("countryshortname") or doc.get("operatingunit") or ""
             deadline_iso = _to_iso(doc.get("submissiondeadline"))
             pub_iso = _to_iso(doc.get("publicationdate"))
 
-            # Keep if (deadline is in the future) OR (published within days_back)
             keep = False
             if deadline_iso and deadline_iso >= today_iso:
                 keep = True
@@ -87,45 +104,38 @@ def _wb_fetch_impl(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str,
             if not keep:
                 continue
 
-            item = {
+            items.append({
                 "title": title,
                 "source": "World Bank",
                 "deadline": deadline_iso,
                 "country": country,
-                "topic": None,  # inferred later by your normalizer
+                "topic": None,
                 "url": url,
                 "summary": f"{title} {country} pub:{pub_iso or ''}".lower(),
-            }
-            out.append(item)
+            })
 
         total = _total_count(j)
         offset += rows
         if total and offset >= total:
             break
-        # safety stop to avoid runaway loops
-        if offset >= 4000:
+        if offset >= max_offset:
             break
 
-    # Optional: apply OGP filter/excludes here (keeps back-compat behavior)
     if ogp_only:
         try:
             from filters import ogp_relevant, is_excluded
-            filtered = []
-            for it in out:
-                txt = f"{it.get('title','')} {it.get('summary','')}"
-                if ogp_relevant(txt) and not is_excluded(txt):
-                    filtered.append(it)
-            out = filtered
+            items = [it for it in items
+                     if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")
+                     and not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
         except Exception:
             pass
 
-    return out
+    return items
 
 class Connector:
     def fetch(self, days_back: int = 90):
         return _wb_fetch_impl(days_back=days_back, ogp_only=True)
 
-# ---- Back-compat procedural API (for existing aggregator) ----
 def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
     return _wb_fetch_impl(days_back=since_days, ogp_only=ogp_only)
 
