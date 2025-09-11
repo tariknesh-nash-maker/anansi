@@ -1,130 +1,161 @@
 # connectors/eu_ft.py
+# EU F&T (TED v3 Search API) connector
+# - Uses POST /v3/notices/search with a non-empty `fields` list (required)
+# - Parses `notices` and `totalNoticeCount` (current v3 response shape)
+# - Emits useful diagnostics & drops JSON samples into ./debug on first page
+
 from __future__ import annotations
 from typing import List, Dict, Any
-from datetime import datetime, timedelta, timezone
-import os, json, html, requests
+from datetime import date, timedelta
+import os, json, html, logging, requests
 
-# --- minimal debug helpers (no external dep) ---
-def _is_on(*envs: str) -> bool:
-    for e in envs:
-        v = os.getenv(e)
-        if v and str(v).strip().lower() in ("1","true","yes","on"): return True
-    return False
-def _kv(prefix: str, **kw):
-    print(f"[{prefix}] " + " ".join(f"{k}={repr(v)}" for k,v in kw.items()))
+log = logging.getLogger(__name__)
 
-API_URL = "https://api.ted.europa.eu/v3/notices/search"
-UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)")
-
-# Default fields per official demo (Publication no., Title, Buyer, Type, Pub date, Place)
-DEFAULT_FIELDS = [
-    "publication-number", "notice-title", "buyer-name",
-    "notice-type", "publication-date", "place-of-performance"
-]
-# Allow override via env (comma-separated)
-_env_fields = [x.strip() for x in os.getenv("EUFT_FIELDS","").split(",") if x.strip()]
-FIELDS = _env_fields or DEFAULT_FIELDS
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": UA,
+TED_URL = "https://api.ted.europa.eu/v3/notices/search"
+HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
-})
+    "User-Agent": os.getenv("ANANSI_UA", "Mozilla/5.0 (compatible; anansi/1.0)"),
+}
 
-def _yyyymmdd(d: datetime) -> str:
-    return d.strftime("%Y%m%d")
+# Minimal but useful fields. You can override via env: EUFT_FIELDS="publication-number,notice-title,publication-date"
+DEFAULT_FIELDS = [
+    "publication-number",
+    "notice-title",
+    "buyer-name",
+    "country",
+    "place-of-performance",
+    "deadline-received-tenders",
+    "notice-type",
+]
+_env_fields = [x.strip() for x in os.getenv("EUFT_FIELDS", "").split(",") if x.strip()]
+FIELDS = _env_fields or DEFAULT_FIELDS
 
-def _build_query(days_back: int) -> str:
-    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days_back)
-    # v3 supports expert query syntax like "publication-date>=YYYYMMDD"
-    return f"publication-date>={_yyyymmdd(datetime(cutoff.year, cutoff.month, cutoff.day))}"
+def _dump(name: str, content: str | dict) -> None:
+    try:
+        os.makedirs("debug", exist_ok=True)
+        path = os.path.join("debug", name)
+        with open(path, "w", encoding="utf-8") as f:
+            if isinstance(content, (dict, list)):
+                json.dump(content, f, ensure_ascii=False, indent=2)
+            else:
+                f.write(content)
+    except Exception:
+        pass
 
-def _normalize(row: Dict[str, Any]) -> Dict[str, Any] | None:
-    pub_no = (row.get("publication-number") or "").strip()
-    if not pub_no:
+def _since_query(since_days: int | None) -> str:
+    if since_days is None:
+        return ""
+    cutoff = date.today() - timedelta(days=since_days)
+    return f"publication-date>={cutoff:%Y%m%d}"
+
+def _normalize_date(val: Any) -> str | None:
+    if not val:
         return None
-    title = (row.get("notice-title") or f"TED Notice {pub_no}").strip()
-    url = f"https://ted.europa.eu/en/notice/-/detail/{pub_no}"
-    text = title.lower()
-    topic = None
-    if any(k in text for k in ("digital", "data", "ict", "software", "information system")):
-        topic = "Digital Governance"
-    elif any(k in text for k in ("audit", "budget", "tax", "revenue", "pfm")):
-        topic = "Fiscal Openness"
-    elif any(k in text for k in ("open data", "transparency", "participation", "citizen", "integrity", "anti-corruption")):
-        topic = "Open Government"
+    s = str(val).strip()
+    # Accept forms like 20250930 or 2025-09-30Z
+    if s.isdigit() and len(s) == 8:
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    if "T" in s:
+        return s.split("T", 1)[0]
+    return s
+
+def _guess_topic(title: str | None) -> str | None:
+    t = (title or "").lower()
+    if any(k in t for k in ("audit", "internal audit", "pfm", "budget")):
+        return "Fiscal Openness"
+    if any(k in t for k in ("digital", "data", "ict", "software", "information system")):
+        return "Digital Governance"
+    if any(k in t for k in ("open data", "transparency", "participation", "integrity", "anti-corruption", "citizen")):
+        return "Open Government"
+    return None
+
+def _normalize_notice(n: dict) -> Dict[str, Any] | None:
+    # Some responses put values directly on the notice; others under "fields"
+    f = n.get("fields") or n
+    pubno = (f.get("publication-number") or "").strip()
+    title = (f.get("notice-title") or "").strip()
+    if not (pubno or title):
+        return None
+    url = f"https://ted.europa.eu/en/notice/-/detail/{pubno}" if pubno else None
+    deadline = _normalize_date(f.get("deadline-received-tenders"))
+    country = (f.get("country") or f.get("place-of-performance") or "").strip() or None
     return {
-        "title": html.unescape(title),
-        "source": "EU TED",
-        "deadline": None,
-        "country": "",
-        "topic": topic,
+        "source": "EU F&T (TED)",
+        "title": html.unescape(title or f"TED notice {pubno}").strip(),
+        "country": country,
+        "deadline": deadline,          # keep key name 'deadline' for aggregator
         "url": url,
+        "topic": _guess_topic(title),
         "summary": title.lower(),
     }
 
-def _post(query: str, page: int, limit: int, verbose: bool) -> list[dict]:
-    payload = {
-        "query": query,                      # REQUIRED
-        "fields": FIELDS,                    # REQUIRED (fix for 400)
-        "page": page,
-        "limit": limit,
-        "scope": os.getenv("EUFT_SCOPE","ACTIVE"),      # ACTIVE | LATEST | ALL
-        "checkQuerySyntax": False,
-        "paginationMode": "PAGE_NUMBER",
-    }
-    r = SESSION.post(API_URL, data=json.dumps(payload), timeout=45)
-    if verbose or r.status_code >= 400:
-        _kv("eu_ft:req", query=query, page=page, limit=limit, http=r.status_code, bytes=len(r.text or ""))
-        if r.status_code >= 400:
-            print(f"[eu_ft] HTTP {r.status_code}: {r.text[:300]}")
-    try:
+def fetch(ogp_only: bool = True, since_days: int | None = 90, pages: int = 1, limit: int = 40, **kwargs):
+    # Build expert query; don’t send empty query (server accepts but pointless)
+    q_base = _since_query(since_days)
+    user_q = os.getenv("EUFT_QUERY", "").strip()
+    if user_q:
+        query = user_q
+    else:
+        # Add a broad FT() filter if ogp_only to avoid huge result sets
+        ft = "(FT=(open OR governance OR transparency OR procurement OR audit OR digital))"
+        query = f"{ft} AND ({q_base})" if (ogp_only and q_base) else (ft if ogp_only else (q_base or "FT=procurement"))
+
+    scope = os.getenv("EUFT_SCOPE", "ACTIVE")  # ACTIVE | LATEST | ALL
+    results: List[Dict[str, Any]] = []
+    total = None
+
+    for page in range(1, max(1, pages) + 1):
+        body = {
+            "query": query,
+            "fields": FIELDS,
+            "page": page,
+            "limit": min(limit, 250),
+            "scope": scope,
+            "checkQuerySyntax": False,
+            "paginationMode": "PAGE_NUMBER",
+        }
+        r = requests.post(TED_URL, headers=HEADERS, json=body, timeout=40)
+        log.info("[eu_ft:req] query=%r page=%d limit=%d http=%d bytes=%d", query, page, limit, r.status_code, len(r.content))
         r.raise_for_status()
-    except requests.HTTPError:
-        return []
-    try:
-        data = r.json() or {}
-    except Exception:
-        print("[eu_ft] WARN: response not JSON")
-        return []
-    rows = data.get("results") or data.get("items") or []
-    if verbose:
-        _kv("eu_ft:parsed", rows=len(rows), total=data.get("total"))
-    return rows
 
-def _eu_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    verbose = _is_on("EUFT_DEBUG","DEBUG")
-    limit = min(int(os.getenv("EUFT_MAX","40")), 250)
-    page = 1
-
-    base_q = os.getenv("EUFT_QUERY") or _build_query(days_back)
-    variants = [base_q, base_q.replace("publication-date","PD")]  # PD is accepted alias in demos
-
-    items: List[Dict[str, Any]] = []
-    for idx, q in enumerate(variants):
-        rows = _post(q, page, limit, verbose=verbose)
-        normed = [n for r in rows if (n := _normalize(r))]
-        if verbose: _kv("eu_ft:norm", variant=idx, normed=len(normed))
-        if normed:
-            items = normed
+        try:
+            data = r.json()
+        except Exception:
+            _dump("euft_raw_response.txt", r.text[:20000])
+            log.warning("[eu_ft] JSON decode failed; wrote debug/euft_raw_response.txt")
             break
 
-    if not items and not verbose:
-        # force one diagnostic emission if still empty
-        _post(base_q, page, limit, verbose=True)
+        # v3 shape
+        notices = data.get("notices") or []
+        total = data.get("totalNoticeCount")
+        log.info("[eu_ft:parsed] page=%d rows=%d total=%s keys=%s", page, len(notices), total, list(data.keys())[:8])
 
-    if ogp_only and items:
-        preferred = [it for it in items if it.get("topic")]
-        items = preferred or items
-    return items
+        if page == 1:
+            if len(notices) == 0:
+                _dump("euft_debug_top_level.json", data)
+            else:
+                _dump("euft_debug_first_notice.json", notices[0])
 
-class Connector:
-    def fetch(self, days_back: int = 90):
-        return _eu_fetch(days_back=days_back, ogp_only=True)
+        for n in notices:
+            item = _normalize_notice(n)
+            if item:
+                results.append(item)
 
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    return _eu_fetch(days_back=since_days, ogp_only=ogp_only)
+        if not notices:  # stop if page is empty
+            break
+
+    # Soft preference for OGP topics but never zero-out
+    if ogp_only and results:
+        preferred = [it for it in results if it.get("topic")]
+        results = preferred or results
+
+    log.info("[eu_ft:norm] returned=%d total=%s", len(results), total)
+    return results
 
 def accepted_args():
     return ["ogp_only", "since_days"]
+
+class Connector:
+    def fetch(self, days_back: int = 90):
+        return fetch(ogp_only=True, since_days=days_back)
