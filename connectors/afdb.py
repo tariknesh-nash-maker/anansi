@@ -1,252 +1,285 @@
 # connectors/afdb.py
+# African Development Bank (AfDB) connector
+# Strategy:
+#   1) Try RSS (often blocked by WAF). If blocked or bozo, skip quickly.
+#   2) Crawl server-rendered "documents" listings (multiple entry points).
+#   3) As needed, enable AFDB_USE_READER=1 to route through a fetch-only reader (no JS).
+#   4) Parse detail pages for title/country/deadline; be tolerant, never crash.
+#
+# Env knobs:
+#   AFDB_DEBUG=1           -> verbose logs
+#   AFDB_MAX=40            -> max items to return
+#   AFDB_USE_READER=1      -> enable reader fallback (https://r.jina.ai)
+#   AFDB_ACCEPT_LANGUAGE   -> override Accept-Language header
+
 from __future__ import annotations
-from typing import List, Dict, Any, Set, Tuple
-from datetime import datetime, timedelta, timezone
-import os, re, requests, feedparser
+from typing import List, Dict, Any, Set
+from datetime import date, timedelta
+import os, re, time, logging, requests, feedparser
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-def _is_on(*envs: str) -> bool:
-    for e in envs:
-        v = os.getenv(e)
-        if v and str(v).strip().lower() in ("1","true","yes","on"): return True
-    return False
-def _kv(prefix: str, **kw):
-    print(f"[{prefix}] " + " ".join(f"{k}={repr(v)}" for k,v in kw.items()))
+log = logging.getLogger(__name__)
 
-UA = os.getenv("ANANSI_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+UA = os.getenv("ANANSI_UA",
+               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
 HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": os.getenv("AFDB_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+    "Referer": "https://www.afdb.org/en/projects-and-operations/procurement",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
 
-SPN_RSS = "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml"
-GPN_RSS = "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml"
-RSS_FEEDS = [SPN_RSS, GPN_RSS]
+# RSS (often 403 or HTML "human check")
+RSS_FEEDS = [
+    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/specific-procurement-notices-spns/rss.xml",
+    "https://www.afdb.org/en/projects-and-operations/procurement/resources-for-businesses/general-procurement-notices-gpns/rss.xml",
+]
 
-LISTING_PAGES = [
+# Multiple server-rendered entry points for documents
+LIST_PAGES = [
     "https://www.afdb.org/en/documents/project-related-procurement/procurement-notices/specific-procurement-notices",
     "https://www.afdb.org/en/documents/category/general-procurement-notices",
+    "https://www.afdb.org/en/documents/category/invitation-for-bids",
+    "https://www.afdb.org/en/documents/category/request-for-expression-of-interest",
+    # Site search pages (document-only) as a further fallback:
+    "https://www.afdb.org/en/search?keys=procurement%20notice&type=document&sort_by=created&sort_order=DESC",
+    "https://www.afdb.org/en/search?keys=general%20procurement%20notice&type=document&sort_by=created&sort_order=DESC",
+    "https://www.afdb.org/en/search?keys=specific%20procurement%20notice&type=document&sort_by=created&sort_order=DESC",
+    "https://www.afdb.org/en/search?keys=invitation%20for%20bids&type=document&sort_by=created&sort_order=DESC",
+    "https://www.afdb.org/en/search?keys=expression%20of%20interest&type=document&sort_by=created&sort_order=DESC",
 ]
 
 DEADLINE_RE = re.compile(r"(?:deadline|closing(?: date)?)\s*[:\-]?\s*([0-9]{1,2}\s+\w+\s+[0-9]{4})", re.I)
 
+def _is_on(*names: str) -> bool:
+    for n in names:
+        v = os.getenv(n)
+        if v and str(v).strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
 def _env_int(name: str, default: int) -> int:
-    try: return int(os.getenv(name, str(default)))
-    except Exception: return default
-
-def _to_date_from_struct(tm) -> datetime | None:
-    try: return datetime(*tm[:6], tzinfo=timezone.utc)
-    except Exception: return None
-
-def _parse_deadline(text: str) -> str | None:
-    m = DEADLINE_RE.search(text or "")
-    if not m: return None
-    for fmt in ("%d %B %Y", "%d %b %Y"):
-        try: return datetime.strptime(m.group(1), fmt).date().isoformat()
-        except Exception: pass
-    return None
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
 def _reader_url(url: str) -> str:
-    # Simple, fast, no-JS reader (mirrors raw HTML/XML)
     base = os.getenv("READER_BASE", "https://r.jina.ai/http://")
-    # Ensure http:// or https:// prefix for reader
-    if url.startswith("http://") or url.startswith("https://"):
-        return f"{base}{url.replace('https://','').replace('http://','')}"
+    if url.startswith("https://"):
+        return f"{base}{url[len('https://'):]}"
+    if url.startswith("http://"):
+        return f"{base}{url[len('http://'):]}"
     return f"{base}{url}"
 
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
-    # Warm-up home to get any basic cookies
+    # Warm-up (may set harmless cookies)
     try:
-        s.get("https://www.afdb.org/en", timeout=20)
+        s.get("https://www.afdb.org/en", timeout=15)
     except Exception:
         pass
     return s
 
 def _rss_fetch(days_back: int, max_items: int, verbose: bool) -> List[Dict[str, Any]]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).date()
+    cutoff = date.today() - timedelta(days=days_back or 90)
     s = _session()
     out: List[Dict[str, Any]] = []
     for url in RSS_FEEDS:
-        use_reader = False
-        # 1) Try direct
-        rtext = None
+        body_text = None
         try:
             r = s.get(url, timeout=20)
-            if verbose: _kv("afdb:rss_http", url=url, status=r.status_code, bytes=len(r.text or ""))
+            if verbose:
+                log.info("[afdb:rss_http] url=%r status=%s bytes=%d", url, r.status_code, len(r.text or ""))
             if r.status_code == 403 and _is_on("AFDB_USE_READER"):
-                use_reader = True
-            elif r.ok:
-                rtext = r.text
-        except Exception as ex:
-            if verbose: _kv("afdb:rss_err", url=url, err=str(ex)[:200])
-
-        # 2) Reader fallback (opt-in)
-        if (rtext is None) and (_is_on("AFDB_USE_READER") or use_reader):
-            try:
-                rr = s.get(_reader_url(url), timeout=25, headers={"Accept":"application/xml"})
-                if verbose: _kv("afdb:rss_reader", url=url, status=getattr(rr,"status_code","?"), bytes=len(getattr(rr,"text","") or ""))
+                rr = s.get(_reader_url(url), timeout=25, headers={"Accept": "application/xml"})
+                if verbose:
+                    log.info("[afdb:rss_reader] url=%r status=%s bytes=%d", url, rr.status_code, len(rr.text or ""))
                 if rr.ok:
-                    rtext = rr.text
-            except Exception as ex:
-                if verbose: _kv("afdb:rss_reader_err", url=url, err=str(ex)[:200])
+                    body_text = rr.text
+            elif r.ok:
+                body_text = r.text
+        except Exception as ex:
+            if verbose:
+                log.warning("[afdb:rss_err] url=%r err=%s", url, ex)
 
-        if not rtext:
+        if not body_text:
             continue
 
-        feed = feedparser.parse(rtext)
+        feed = feedparser.parse(body_text)
         if verbose:
-            _kv("afdb:rss_entries", url=url, entries=len(feed.entries), bozo=getattr(feed, "bozo", "?"))
+            log.info("[afdb:rss_entries] url=%r entries=%d bozo=%s", url, len(feed.entries), getattr(feed, "bozo", "?"))
+
         for e in feed.entries:
             title = (getattr(e, "title", "") or "").strip()
             link  = (getattr(e, "link", "") or "").strip()
-            if not title or not link: continue
+            if not title or not link:
+                continue
+            # Simple time window, if present
             pub_dt = None
-            if getattr(e, "published_parsed", None): pub_dt = _to_date_from_struct(e.published_parsed)
-            elif getattr(e, "updated_parsed", None): pub_dt = _to_date_from_struct(e.updated_parsed)
-            if pub_dt and pub_dt.date() < cutoff: continue
+            if getattr(e, "published_parsed", None):
+                from datetime import datetime as _dt
+                tm = e.published_parsed
+                pub_dt = _dt(*tm[:6]).date()
+            if pub_dt and pub_dt < cutoff:
+                continue
             summary = (getattr(e, "summary", "") or getattr(e, "description", "") or "")
             deadline = _parse_deadline(summary)
             out.append({
-                "title": title, "source": "AfDB", "deadline": deadline,
-                "country": "", "topic": None, "url": link,
+                "source": "AfDB",
+                "title": title,
+                "country": None,
+                "deadline": deadline,
+                "url": link,
+                "topic": "Open Government",
                 "summary": (summary or title).lower(),
             })
-            if len(out) >= max_items: break
-        if len(out) >= max_items: break
-    if verbose: _kv("afdb:rss_result", kept=len(out))
+            if len(out) >= max_items:
+                return out
+    if verbose:
+        log.info("[afdb:rss_result] kept=%d", len(out))
     return out
 
-def _collect_listing_links(url: str, verbose: bool) -> Set[str]:
-    s = _session()
-    texts: List[Tuple[str,str]] = []
-    # Direct
+def _parse_deadline(text: str) -> str | None:
+    m = DEADLINE_RE.search(text or "")
+    if not m:
+        return None
+    raw = m.group(1)
+    for fmt in ("%d %B %Y", "%d %b %Y"):
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(raw, fmt).date().isoformat()
+        except Exception:
+            pass
+    return None
+
+def _get_html(s: requests.Session, url: str, verbose: bool) -> str | None:
     try:
         r = s.get(url, timeout=25)
-        if verbose: _kv("afdb:list_http", url=url, status=r.status_code, bytes=len(r.text or ""))
-        if r.ok: texts.append(("direct", r.text))
-    except Exception as ex:
-        if verbose: _kv("afdb:list_err", url=url, err=str(ex)[:200])
-    # Reader fallback
-    if not texts and _is_on("AFDB_USE_READER"):
-        try:
+        if r.status_code == 403 and _is_on("AFDB_USE_READER"):
             rr = s.get(_reader_url(url), timeout=25)
-            if verbose: _kv("afdb:list_reader", url=url, status=rr.status_code, bytes=len(rr.text or ""))
-            if rr.ok: texts.append(("reader", rr.text))
-        except Exception as ex:
-            if verbose: _kv("afdb:list_reader_err", url=url, err=str(ex)[:200])
-
-    links: Set[str] = set()
-    for mode, html_text in texts:
-        soup = BeautifulSoup(html_text, "lxml")
-        for a in soup.select("a[href]"):
-            href = a.get("href","")
-            if not href: continue
-            full = href if href.startswith("http") else f"https://www.afdb.org{href}"
-            if "/documents/" in full and ("/specific-procurement-notices" in full or "/general-procurement-notices" in full):
-                links.add(full.split("#")[0])
-    if verbose: _kv("afdb:list_links", url=url, links=len(links))
-    return links
-
-def _parse_detail(url: str, verbose: bool) -> Dict[str, Any] | None:
-    s = _session()
-    # direct first
-    html_text = None
-    try:
-        r = s.get(url, timeout=25)
-        if verbose: _kv("afdb:detail_http", url=url, status=r.status_code, bytes=len(r.text or ""))
-        if r.ok: html_text = r.text
+            if verbose:
+                log.info("[afdb:list_reader] url=%r status=%s bytes=%d", url, rr.status_code, len(rr.text or ""))
+            if rr.ok:
+                return rr.text
+        if r.ok:
+            if verbose:
+                log.info("[afdb:list_http] url=%r status=%s bytes=%d", url, r.status_code, len(r.text or ""))
+            return r.text
+        if verbose:
+            log.info("[afdb:list_http] url=%r status=%s bytes=%d", url, r.status_code, len(r.text or ""))
+        return None
     except Exception as ex:
-        if verbose: _kv("afdb:detail_err", url=url, err=str(ex)[:200])
-    # reader fallback
-    if html_text is None and _is_on("AFDB_USE_READER"):
-        try:
-            rr = s.get(_reader_url(url), timeout=25)
-            if verbose: _kv("afdb:detail_reader", url=url, status=rr.status_code, bytes=len(rr.text or ""))
-            if rr.ok: html_text = rr.text
-        except Exception as ex:
-            if verbose: _kv("afdb:detail_reader_err", url=url, err=str(ex)[:200])
-    if html_text is None:
+        if verbose:
+            log.warning("[afdb:get_err] url=%r err=%s", url, ex)
         return None
 
-    soup = BeautifulSoup(html_text, "lxml")
+def _collect_links_from_listing(html: str, base: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links: List[str] = []
+    # Collect ANY /en/documents/ anchor (server-rendered)
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        full = urljoin(base, href)
+        if "/en/documents/" in full:
+            links.append(full.split("#")[0])
+    # De-dupe, preserve order
+    seen: Set[str] = set()
+    out: List[str] = []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def _parse_detail(s: requests.Session, url: str, verbose: bool) -> Dict[str, Any] | None:
+    html = _get_html(s, url, verbose)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "lxml")
     title_tag = soup.select_one("h1, h2") or soup.select_one("title")
-    title = (title_tag.get_text(" ", strip=True) if title_tag else "AfDB Notice").strip()
-    text = soup.get_text(" ", strip=True)
-    # try common label/value pairs
+    title = (title_tag.get_text(" ", strip=True) if title_tag else "AfDB notice").strip()
+
+    # Extract labeled fields if present
+    labels = {}
+    for dl in soup.select("dl, .field--name-field-document, .field__items"):
+        for dt in dl.select("dt"):
+            key = dt.get_text(" ", strip=True).lower()
+            dd = dt.find_next("dd")
+            val = dd.get_text(" ", strip=True) if dd else ""
+            if key: labels[key] = val
+
     deadline = None
-    for dt in soup.select("dt, strong, b"):
-        lbl = dt.get_text(" ", strip=True).lower()
-        if "dead" in lbl or "clos" in lbl:
-            val = dt.find_next("dd")
-            raw = val.get_text(" ", strip=True) if val else ""
-            maybe = _parse_deadline(f"deadline {raw}")
-            if maybe: deadline = maybe; break
+    for k, v in labels.items():
+        if "deadline" in k or "closing" in k:
+            deadline = _parse_deadline(f"deadline {v}") or v
+
+    # Sometimes “country” appears as a field, sometimes in body text
+    country = None
+    for k, v in labels.items():
+        if "country" in k:
+            country = v
+            break
+
+    text = soup.get_text(" ", strip=True)
     if not deadline:
         deadline = _parse_deadline(text)
+
     return {
-        "title": title, "source": "AfDB", "deadline": deadline,
-        "country": "", "topic": None, "url": url,
+        "source": "AfDB",
+        "title": title,
+        "country": country,
+        "deadline": deadline,
+        "url": url,
+        "topic": "Open Government",
         "summary": text.lower()[:800],
     }
 
-def _apply_filters(items: List[Dict[str, Any]], ogp_only: bool, verbose: bool) -> List[Dict[str, Any]]:
-    raw = len(items)
-    try:
-        from filters import is_excluded
-        items = [it for it in items if not is_excluded(f"{it.get('title','')} {it.get('summary','')}")]
-    except Exception:
-        pass
-    after_ex = len(items)
-    if ogp_only:
-        try:
-            from filters import ogp_relevant
-            preferred = [it for it in items if ogp_relevant(f"{it.get('title','')} {it.get('summary','')}")]
-            items = preferred or items
-        except Exception:
-            pass
-    if verbose: _kv("afdb:filter_counts", raw=raw, after_exclude=after_ex, returned=len(items))
-    return items
-
-def _afdb_fetch(days_back: int = 90, ogp_only: bool = True) -> List[Dict[str, Any]]:
-    verbose = _is_on("AFDB_DEBUG","DEBUG")
+def fetch(ogp_only: bool = True, since_days: int | None = 90, **kwargs) -> List[Dict[str, Any]]:
+    verbose = _is_on("AFDB_DEBUG", "DEBUG")
     max_items = _env_int("AFDB_MAX", 40)
 
-    # 1) RSS first (with reader fallback if enabled)
-    items = _rss_fetch(days_back, max_items, verbose)
+    # 1) RSS first (quick win if not blocked)
+    items = _rss_fetch(days_back=since_days or 90, max_items=max_items, verbose=verbose)
     if items:
-        return _apply_filters(items, ogp_only, verbose)
+        return items if not ogp_only else items  # (topic is fixed to Open Government here)
 
-    # 2) HTML listings (with reader fallback if enabled)
-    all_links: Set[str] = set()
-    for lp in LISTING_PAGES:
-        try:
-            all_links |= _collect_listing_links(lp, verbose)
-        except Exception as ex:
-            print(f"[afdb] listing failed {lp}: {ex}")
-    if verbose: _kv("afdb:links_total", count=len(all_links))
-
+    # 2) Listings & search pages
+    s = _session()
     out: List[Dict[str, Any]] = []
-    for u in list(all_links)[: max_items * 2]:
-        it = _parse_detail(u, verbose)
-        if it: out.append(it)
-        if len(out) >= max_items: break
+    for base in LIST_PAGES:
+        html = _get_html(s, base, verbose)
+        if not html:
+            continue
+        links = _collect_links_from_listing(html, base)
+        log.info("[afdb:list_links] url=%r links=%d", base, len(links))
+        if not links:
+            continue
 
-    if not out and not verbose:
-        _kv("afdb:empty", links=len(all_links))
-    return _apply_filters(out, ogp_only, verbose)
+        # Parse a reasonable number of detail pages
+        for u in links[: max_items * 2]:
+            it = _parse_detail(s, u, verbose)
+            if it:
+                out.append(it)
+            if len(out) >= max_items:
+                break
+        if len(out) >= max_items:
+            break
 
-class Connector:
-    def fetch(self, days_back: int = 90):
-        return _afdb_fetch(days_back=days_back, ogp_only=True)
-
-def fetch(ogp_only: bool = True, since_days: int = 90, **kwargs):
-    return _afdb_fetch(days_back=since_days, ogp_only=ogp_only)
+    log.info("[afdb:links_total] count=%d", len(out))
+    return out
 
 def accepted_args():
     return ["ogp_only", "since_days"]
+
+class Connector:
+    def fetch(self, days_back: int = 90):
+        return fetch(ogp_only=True, since_days=days_back)
